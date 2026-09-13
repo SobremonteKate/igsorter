@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IG Saved Sorter</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --panel-2: #1e222b;
+        --text: #e8eaf0;
+        --muted: #9aa3b2;
+        --accent: #d62976;
+        --accent-2: #4f5bd5;
+        --ok: #3ecf8e;
+        --warn: #f0a13a;
+        --err: #ff6b6b;
+        --border: #262b36;
+      }
+      * { box-sizing: border-box; }
+      body {
+        width: 372px;
+        margin: 0;
+        padding: 12px;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        letter-spacing: 0.2px;
+      }
+      h1 span {
+        background: linear-gradient(90deg, var(--accent), var(--accent-2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      input[type="text"], input[type="password"], textarea, select {
+        width: 100%;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--text);
+        padding: 6px 8px;
+        font: inherit;
+        font-size: 12px;
+      }
+      select { cursor: pointer; }
+      textarea { resize: vertical; min-height: 58px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      input:focus, textarea:focus { outline: 1px solid var(--accent-2); border-color: var(--accent-2); }
+      .row { display: flex; gap: 6px; align-items: center; }
+      .row.between { justify-content: space-between; }
+      .stack { display: flex; flex-direction: column; gap: 6px; }
+      button {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 7px 9px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+        text-align: left;
+      }
+      button:hover:not(:disabled) { border-color: var(--accent-2); }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      button.primary {
+        background: linear-gradient(90deg, rgba(214,41,118,0.22), rgba(79,91,213,0.22));
+        border-color: rgba(214,41,118,0.45);
+        font-weight: 600;
+      }
+      button.ghost { background: transparent; }
+      button.armed { border-color: var(--err); color: var(--err); font-weight: 600; }
+      label.check {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 12px;
+        color: var(--text);
+        margin: 0;
+        cursor: pointer;
+      }
+      label.check input { accent-color: var(--accent); }
+      pre {
+        margin: 0;
+        max-height: 250px;
+        overflow: auto;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px;
+        font: 10.5px/1.4 ui-monospace, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      button.small { padding: 4px 7px; font-size: 11px; }
+      .muted { color: var(--muted); }
+      .tiny { font-size: 11px; }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .err { color: var(--err); }
+      .counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 8px 0 6px; }
+      .count {
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 4px;
+        text-align: center;
+      }
+      .count b { display: block; font-size: 15px; }
+      .count span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.3px; }
+      .bar { height: 6px; background: var(--panel-2); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+      .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.25s ease; }
+      #feedback { min-height: 16px; font-size: 11.5px; margin-top: 6px; }
+      #feedback.ok { color: var(--ok); }
+      #feedback.warn { color: var(--warn); }
+      #feedback.err { color: var(--err); }
+      #errors { max-height: 108px; overflow: auto; font-size: 11px; }
+      #errors div { padding: 3px 0; border-bottom: 1px dashed var(--border); word-break: break-word; }
+      #errors div:last-child { border-bottom: none; }
+      code { background: var(--panel-2); padding: 0 4px; border-radius: 4px; font-size: 11px; }
+      a { color: #8ab4ff; }
+      details summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+    </style>
+  </head>
+  <body>
+    <h1><span>IG Saved Sorter</span></h1>
+
+    <section class="stack">
+      <div>
+        <label for="provider">Model provider</label>
+        <select id="provider"></select>
+        <div id="providerHint" class="tiny muted" style="margin-top: 4px"></div>
+      </div>
+      <div>
+        <label for="model">Model</label>
+        <input id="model" type="text" spellcheck="false" placeholder="model name" />
+      </div>
+      <div id="baseUrlRow" style="display: none">
+        <label for="baseUrl">Base URL (OpenAI-compatible)</label>
+        <input id="baseUrl" type="text" spellcheck="false" placeholder="https://host/v1" />
+      </div>
+      <div>
+        <label for="apiKey">API key <span id="keyNote" class="muted"></span></label>
+        <input id="apiKey" type="password" placeholder="paste key" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="row between">
+        <span id="keyLink" class="tiny"></span>
+        <span class="row">
+          <button id="testProvider" class="small">Test</button>
+          <button id="saveProvider" class="small primary">Save</button>
+        </span>
+      </div>
+      <div id="testResult" class="tiny" style="display: none"></div>
+      <div>
+        <label for="categories">Categories (comma or newline separated)</label>
+        <textarea id="categories" spellcheck="false"></textarea>
+        <div class="row between" style="margin-top: 6px">
+          <span class="tiny muted">Used to create/select Instagram collections.</span>
+          <button id="saveCategories" class="small">Save</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="stack">
+      <button id="start" class="primary">1 · Start Collecting</button>
+      <p class="tiny muted" style="margin: 0">
+        Clears previous data, then watch passively while you scroll your Saved page.
+      </p>
+      <button id="classify">2 · Classify Collected Posts</button>
+      <button id="sort">3 · Sort Into Collections</button>
+      <label class="check" for="dryRun">
+        <input id="dryRun" type="checkbox" />
+        <span>Dry run: inspect the DOM, click nothing</span>
+      </label>
+      <label class="check" for="resortUnconfirmed">
+        <input id="resortUnconfirmed" type="checkbox" />
+        <span>Re-sort posts that were never confirmed</span>
+      </label>
+      <button id="inspect" class="small ghost">Inspect the tab I'm on (no clicks)</button>
+      <div class="row between">
+        <button id="stop" class="small ghost">Stop</button>
+        <button id="clear" class="small ghost">Clear all data</button>
+      </div>
+    </section>
+
+    <section>
+      <div class="row between">
+        <label style="margin: 0">Status</label>
+        <span id="phase" class="tiny muted">idle</span>
+      </div>
+      <div class="counts">
+        <div class="count"><b id="cCollected">0</b><span>collected</span></div>
+        <div class="count"><b id="cClassified">0</b><span>classified</span></div>
+        <div class="count"><b id="cSorted">0</b><span>sorted</span></div>
+        <div class="count"><b id="cFailed">0</b><span>failed</span></div>
+      </div>
+      <div class="bar"><i id="progressBar"></i></div>
+      <div id="jobLabel" class="tiny muted" style="margin-top: 6px">Idle</div>
+      <div id="collectorLine" class="tiny muted" style="margin-top: 4px"></div>
+      <div id="verifyLine" class="tiny muted" style="margin-top: 4px"></div>
+      <div id="feedback"></div>
+      <button id="diagnose" class="small ghost" style="width: 100%; margin-top: 6px">
+        Diagnose state · runs 1 test request
+      </button>
+      <div id="openWrap" class="tiny" style="margin-top: 6px; display: none">
+        <a id="openSaved" href="#" target="_blank" rel="noreferrer">Open your Saved page in a new tab →</a>
+        <div class="muted">Instagram never scrolls itself — you drive the collection phase.</div>
+      </div>
+    </section>
+
+    <section id="reportWrap" style="display: none">
+      <div class="row between">
+        <label style="margin: 0">Dry-run report</label>
+        <button id="copyReport" class="small">Copy</button>
+      </div>
+      <div id="reportMeta" class="tiny muted" style="margin: 4px 0 6px"></div>
+      <pre id="report"></pre>
+    </section>
+
+    <section id="diagWrap" style="display: none">
+      <div class="row between">
+        <label style="margin: 0">Diagnosis</label>
+        <button id="copyDiag" class="small">Copy</button>
+      </div>
+      <div id="diagMeta" class="tiny muted" style="margin: 4px 0 6px"></div>
+      <pre id="diag"></pre>
+    </section>
+
+    <section>
+      <label>Errors &amp; warnings</label>
+      <div id="errors" class="muted">None.</div>
+    </section>
+
+    <details>
+      <summary>How it works</summary>
+      <p class="tiny muted">
+        Collection is passive: the content script only reports tiles your browser has
+        already rendered. Classification sends each thumbnail to the DeepSeek vision
+        model. Write-back opens one background tab per post, clicks the bookmark and
+        the collection checkbox using a logged-in session — your password is never
+        read, stored or sent.
+      </p>
+    </details>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

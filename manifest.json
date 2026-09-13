@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "IG Saved Sorter",
+  "version": "1.0.0",
+  "description": "Passively collects your Instagram saved posts while you scroll, classifies them with a vision model, and sorts them into Instagram collections.",
+  "permissions": ["storage", "scripting", "tabs", "unlimitedStorage"],
+  "host_permissions": [
+    "https://www.instagram.com/*",
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*",
+    "https://api.deepseek.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://openrouter.ai/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "IG Saved Sorter",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["content-scripts/collector.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

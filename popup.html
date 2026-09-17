@@ -114,6 +114,7 @@
         word-break: break-word;
       }
       button.small { padding: 4px 7px; font-size: 11px; }
+      #dismissDiag { min-width: 24px; font-weight: 700; line-height: 1; }
       .muted { color: var(--muted); }
       .tiny { font-size: 11px; }
       .ok { color: var(--ok); }
@@ -241,7 +242,10 @@
     <section id="diagWrap" style="display: none">
       <div class="row between">
         <label style="margin: 0">Diagnosis</label>
-        <button id="copyDiag" class="small">Copy</button>
+        <span class="row">
+          <button id="copyDiag" class="small">Copy</button>
+          <button id="dismissDiag" class="small ghost" title="Hide this report">×</button>
+        </span>
       </div>
       <div id="diagMeta" class="tiny muted" style="margin: 4px 0 6px"></div>
       <pre id="diag"></pre>

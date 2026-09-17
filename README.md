@@ -9,7 +9,7 @@ It works in three phases that you drive from the popup:
 | --- | --- | --- |
 | **1 · Start Collecting** | A content script passively records every saved-post tile you scroll past (shortcode + thumbnail URL). | **You** — scroll your Saved page manually. |
 | **2 · Classify Collected Posts** | The background worker sends each thumbnail to the DeepSeek vision model and stores the resulting category + confidence. | The extension. |
-| **3 · Sort Into Collections** | For every classified post the worker opens a background tab, clicks the bookmark icon, selects (or creates) the matching collection, then closes the tab. | The extension. |
+| **3 · Sort Into Collections** | For every classified post the worker opens a background tab, opens the *Collections* popover (it is mounted but CSS-hidden, so the writer reveals it), selects (or creates) the matching collection, then closes the tab. | The extension. |
 
 The extension **never** reads, stores or transmits your Instagram password. Phase 3
 reuses the session cookies your browser already has, exactly as if you had clicked
@@ -86,20 +86,71 @@ demand with `chrome.scripting.executeScript({ files: [...] })`.
 
 ### Step 2 — “Classify Collected Posts”
 
-* Sends each unclassified thumbnail to `deepseek-flash` with a fixed system prompt
-  that forces JSON in the shape `{"category": "...", "confidence": 0.0-1.0}`.
+* Sends each unclassified thumbnail to the configured vision model with a fixed
+  system prompt that forces JSON in the shape `{"category": "...", "confidence": 0.0-1.0}`.
 * Runs up to **3 concurrent** requests with up to **3 retries** each (exponential
   backoff). Failures are logged and skipped — one bad image never stops the batch.
+* A **per-minute** 429 is treated as a scheduling problem, not a post failure: the
+  refused post is re-queued for the same run and all requests then wait out a
+  shared ~65 s cool-down, so a free tier's 20-requests-per-minute window simply
+  paces the batch instead of failing posts. A **per-day** quota still aborts the
+  batch outright (nothing marked failed; see the troubleshooting table).
 * Progress, per-post errors and warnings appear in the popup. Re-running the button
   retries anything that failed, so this phase is safely resumable.
 
 ### Step 3 — “Sort Into Collections”
 
 * For each classified post that is not yet written: opens
-  `https://www.instagram.com/p/<shortcode>/` in an **inactive** tab, waits for it to
-  load, injects `writer.js`, waits for the *Save to collection* panel, ticks the
-  checkbox for the category (creating the collection if it doesn't exist), then
-  closes the tab.
+  `https://www.instagram.com/reel/<shortcode>/` (or `/p/`) in an **inactive** tab,
+  waits for it to load, injects `writer.js`, opens the collection picker, selects
+  the matching row (creating the collection if it doesn't exist), then closes the
+  tab.
+* **The picker's reveal is pure CSS `:hover`, which no scripted event can
+  produce — so the writer does not try to hover.** Hovering the bookmark shows a
+  *Collections* list above it; clicking it on an already-saved post only toggles the
+  post out of your library and opens nothing. But the popover is **already mounted
+  in the DOM**, merely hidden. So the writer finds it and makes it visible itself:
+  every element that is hiding it gets inline `!important` styles, the row is
+  clicked, and then each of those styles is put back — the same thing a real pointer
+  leaving the bookmark would have done. Routes, in order: **reveal the mounted
+  popover** (instant, no waiting) → hover (for builds that reveal it from a JS
+  handler) → **bookmark click, only when the post is not in your library yet**,
+  where that click *is* the save action. If a click ever toggles a post out of the
+  library it is clicked back, and on a total failure the post is restored to the
+  state it was found in.
+* **The ⋯ menu is no longer used.** On this build its menu has no *Save to
+  collection* item on `/p/` **or** `/reels/` pages (Report / Go to post / Share to… /
+  Copy link / Embed / About this account), so that route could never reach the
+  picker — all it did was click the three-dots control. The dry run still reports
+  whether the control exists, as information only.
+* The panel is found by a ladder (dialog mentioning save/collection, dialog
+  containing checkboxes, **the “Collections” popover — header plus its rows, no
+  checkbox controls required**, that same popover force-revealed when it is mounted
+  but hidden, or any visible container holding a group of 2+ checkboxes). The
+  popover is identified as the **deepest** container whose text starts with
+  “Collections” and which holds row labels: its wrappers contain the same text and
+  are deliberately never adopted (a wrapper looks like a visible panel with no rows
+  in it, which is how the writer used to end up clicking nothing). The row to click
+  is the deepest clickable that carries the category's label, never an outer
+  wrapper. When all routes miss, the error names **every** dead end and why, e.g.
+  `save_panel_unreachable (reveal mounted popover: no mounted Collections popover in
+  the DOM; bookmark hover: timeout_waiting_for_collections_popover_on_hover) - no
+  Collections popover exists in the DOM on this page, …`.
+* After clicking a row the writer reads the selection back — `input.checked`,
+  then `aria-checked`, then a checkmark icon, in that order — and a click whose
+  result cannot be read is reported as **unconfirmed**, not as sorted. If the
+  popover closes or unmounts on the click, it is re-opened (revealed again) and read
+  from there, which is stronger evidence than watching a stale element. The read method is stored
+  per post in `writeTrace.selectionSignal`.
+* The log gets a line **only for the posts that need attention** (unconfirmed, or
+  carrying a warning) plus one roll-up at the end of the run:
+  `Picker routes used: 20× popover revealed (CSS :hover build), 1× hover popover`.
+  That single line tells you which route your build actually needs — if it says
+  `bookmark click` for everything, the popover was not in the DOM and step `1c` of a
+  dry run will say so.
+* If several posts **in a row** fail with the *same* error (a deploy moved the
+  picker, say), the run stops early with that explanation instead of grinding
+  through the rest of the library; the untouched posts simply retry next run.
 * Pacing: a randomised **2–4 s** between posts and a **15–20 s** pause after every
   **20** posts, to stay under Instagram's rate limits.
 * **Fully resumable:** posts already marked `written` are skipped, so you can stop
@@ -153,6 +204,7 @@ vision models are free:
 | --- | --- | --- | --- |
 | **Google Gemini** | free tier | [AI Studio](https://aistudio.google.com/apikey) | Best free option, but the **per-day** cap is easy to hit on a big library. Free-tier limits are per-minute *and* per-day, and Google may use free-tier data for training. |
 | **OpenRouter** | free tier | [openrouter.ai/keys](https://openrouter.ai/keys) | One key, many models. The default model `openrouter/free` routes to a free vision model; you can also name a specific one (e.g. a model ending in `:free`). Some free models require enabling data-sharing in your OpenRouter settings. |
+| **OmniRoute (local gateway)** | free tier pools | none (gateway manages keys) | One local endpoint (`http://localhost:20128/v1`) in front of 150+ free provider tiers with quota-aware fallback — when one runs dry, the next is used automatically. Setup notes below. |
 | **Ollama (local)** | free, offline | none | Runs on your own machine, nothing leaves it. Highest privacy, zero cost, needs a few GB of RAM/VRAM. Setup notes below. |
 | **DeepSeek** | paid | [platform.deepseek.com](https://platform.deepseek.com) | The original default (`deepseek-flash`). Cheap, but not free. |
 | **Custom** | varies | varies | Any OpenAI-compatible `/chat/completions`. Add its host to `host_permissions` in `manifest.json` first, then reload the extension. |
@@ -202,6 +254,29 @@ forgiving — it handles fenced blocks, schema echoes, reasoning-first replies,
 trailing commas, array-shaped content, and both `content` and `reasoning_content`
 payload shapes — but it refuses to guess between two or more stated categories.
 
+### OmniRoute setup (local gateway over many free pools)
+
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is a local, MIT-licensed
+gateway that pools dozens of providers' free tiers behind one OpenAI-compatible
+endpoint, with quota-aware fallback between them. For this extension:
+
+```powershell
+npm install -g omniroute
+omniroute          # keep this window open; dashboard opens at http://localhost:20128
+```
+
+1. In the dashboard's **Providers** page, connect whichever free providers you
+   want pooled (some need just a login, some a pasted key — the gateway holds
+   them, not the extension).
+2. In the popup: **Model provider → OmniRoute**, leave the API key empty, press
+   **Save**, then **Test**. The default model `auto` routes each request to a
+   healthy connected provider.
+3. **Vision matters:** `auto` may hand an image request to a text-only model. If
+   Test fails with a modality error, set **Model** to a specific vision-capable
+   id from the dashboard's catalog instead.
+4. If Classify suddenly fails with `*_not_running`, the gateway window was closed
+   — start `omniroute` again and re-run; posts stay retryable.
+
 ### Ollama setup (fully free, fully local)
 
 ```bash
@@ -234,6 +309,30 @@ mode. Tick **Dry run** under the third button (the button relabels itself to
 background tab and reports **which element each step would act on** — without
 dispatching a single click. Statuses stay `classified`, so nothing looks sorted.
 
+The probe first **hovers the bookmark** (step `1b`). Hovering changes nothing on
+Instagram, but on current builds it also opens nothing: the popover is mounted and
+hidden by CSS `:hover`, a state no scripted event can produce.
+
+So when `1b` reports `MISS`, the next step (`1c. hidden popover`) finds the mounted
+popover and **reveals it, exactly as the real run does** — and the rest of the
+report then verifies the panel, every row, the row it would click and that row's
+current selection state against the real popover. Nothing is clicked: only styles
+are touched, and they are put back before the report is written.
+
+* `1c. RESOLVED` — the normal case on current builds: the popover was mounted but
+  CSS-hidden, and revealing it is precisely what the run does. Steps 2-6 are
+  verified.
+* `1c. MISS` — a popover exists but could not be made visible. The real run fails
+  here too; press **Inspect the tab I'm on** and send the report.
+* `1c. INFO` — no popover in the DOM at all, so either this build only renders it
+  for a real pointer, or the post is not in your library.
+
+The per-post verdict in the log says the same thing in one line: `picker was mounted
+but CSS-hidden; the writer reveals it instead of hovering - 5 step(s) resolved, 0
+miss, 0 gated`, or `picker opened by hovering the bookmark - …`, or `no picker in
+the DOM (real pointer hover only) - …`. Reports are stored per post (up to 80 lines)
+and can be copied out with the popup's Copy button.
+
 Each step in the report is tagged:
 
 | Tag | Meaning |
@@ -246,12 +345,13 @@ Each step in the report is tagged:
 
 ### Verifying the picker-only steps
 
-Steps 2-5 live inside the *Save to collection* panel, which does not exist until
-somebody clicks the bookmark — and the dry run never clicks. So verify those by
-opening the picker yourself:
+Step `1c` already reveals the picker, so on current builds the report covers the
+panel, its rows and the row it would click with no help from you. On a build where
+there is no popover in the DOM at all (the `1c` step reports `INFO`), verify steps
+2-6 by opening the picker yourself:
 
 1. Open any of your saved posts (`https://www.instagram.com/<you>/saved/` → click a post).
-2. Click its bookmark icon yourself. The collection panel opens.
+2. Open the picker the way you would by hand (hover the bookmark; on an older build, ⋯ → *Save to collection*).
 3. Open the popup and press **Inspect the tab I'm on (no clicks)**.
 
 The report then also includes the full row list and a **category map**: for each
@@ -265,11 +365,27 @@ the Copy button, and the log gets a one-line verdict per post, for example:
 ```
 [RESOLVED] 1. save icon — ladder hit: svg[aria-label="Remove"]
     selector   : svg[aria-label="Remove"]
-    would click : div[role="button"]
     bookmark now: in the saved library (aria-label="Remove")
     ladder      : svg[aria-label="Save"]→0  svg[aria-label="Remove"]→1  ...
-[NOT-OPEN] 2. save panel — opened only by clicking the bookmark, so a dry run cannot verify it
---- inventory: 1 dialog(s), 0 checkbox-ish, 0 text input(s) ---
+
+[MISS] 1b. hover route — hovering the bookmark opened nothing (timeout_waiting_for_popover_on_hover)
+    bookmark    : in the saved library
+
+[RESOLVED] 1c. hidden popover — a "Collections" popover was mounted but CSS-hidden, so it was revealed for this report ("Collections" popover - mounted but CSS-hidden, revealed it)
+[RESOLVED] 2. save panel — strategy: "Collections" popover - mounted but CSS-hidden, revealed it
+    rows found  : 6
+      - "woah"
+      - "other"
+      - "study tips"
+      - "memes"   <== matches the category
+[RESOLVED] 3. collection row — row "memes" would be clicked
+    element    : <div> role=button …
+    would click : div[role="button"]
+    selected now: false  (read via no selection mark while other rows have one)
+[INFO] 6. category map — 2 configured categor(ies) resolved against this picker
+    memes              existing row "memes"
+    food               no row here → would create it
+--- inventory: 0 dialog(s), 0 checkbox-ish, 0 text input(s) ---
 --- visible [aria-label] controls (interesting ones first) ---
   svg[aria-label="Remove"]  "Remove"  24x24px
 ```
@@ -380,19 +496,28 @@ re-check if Instagram changes:
 2. **The bookmark control** is reachable by `svg[aria-label="Save"]`, or
    `svg[aria-label="Remove"]` on a post that is already in the library, or by a
    case-insensitive `aria-label*="save"` on an ancestor button.
-3. **Clicking the bookmark opens a `[role="dialog"]`** titled *Save to collection*
-   containing a **New collection** entry and a row per existing collection.
-   Behaviour differs between builds for already-saved posts, so the writer waits
-   for the panel and, if it does not appear, clicks once more (landing back in a
-   saved state) and waits again.
+3. **The picker on a saved post is a CSS-hover popover, not a dialog.** Hovering
+   the bookmark shows a small *Collections* header with a **+** button and one row
+   per collection; rows carry a thumbnail and a name, and nothing about that popover
+   is labelled as a dialog or as a checkbox list (screenshot-verified). Because its
+   show/hide is CSS `:hover` — a state the browser derives from real pointer input,
+   not from dispatched events — the writer does not fake a hover: it locates the
+   mounted popover and reveals it with inline `!important` styles, all of which are
+   reverted right after the row click. Older builds instead open a
+   `[role="dialog"]` titled *Save to collection* from a bookmark click, and those
+   still work through the same ladder.
 4. **Collection rows** are matched by normalised visible text: `study tips` and
    `study_tips` are treated as the same name, exact match preferred over a
    prefix match, and the deepest matching element wins so a wrapper containing
    several names can never be mistaken for a row.
-5. **Selection state** is read from `input[type="checkbox"].checked` or an
-   `aria-checked` attribute. If neither exists the writer cannot tell whether a
-   collection was already ticked — it clicks anyway and reports the
-   `collection_state_unverifiable` warning instead of silently guessing.
+5. **Selection state** is read from `input[type="checkbox"].checked`,
+   `aria-checked` / `aria-selected` / `aria-pressed`, or a checkmark icon inside
+   the row. The icon is only believed when the rows **disagree** — some show it,
+   some do not — because some builds put an unchecked checkbox-looking icon in
+   every row, and a mark that is always there proves nothing. If no signal is
+   readable the writer still clicks, then reports `collection_state_unverifiable`
+   (and marks the post *unconfirmed*) rather than silently guessing. The method
+   used is recorded per post as `writeTrace.selectionSignal`.
 6. **Creating a collection**: the *New collection* button opens a text input
    (found via a `collection` placeholder/`aria-label`, else the last text input),
    the name is typed with a React-compatible native value setter, then confirmed
@@ -435,13 +560,21 @@ one real request, then reports:
 It ends with a numbered **what to do next** list and a **Copy** button, so you can
 see the state without opening a console. Nothing is changed by diagnosing.
 
+The report is a single panel, not an ever-growing feed: **×** next to Copy hides
+it, and it stays hidden across popup refreshes until a *new* diagnosis runs. A
+re-run whose findings are unchanged (same checks and next steps, allowing for
+latency drift) is tagged *unchanged since last run* in the report's header line
+rather than presented as fresh output. Dismissing hides only the panel — the
+stored report is kept, so Copy in a later session still works and **Diagnose
+state** always produces a new one.
+
 
 | Symptom | Cause / fix |
 | --- | --- |
 | `*_404` / model not found | The model name does not exist at that endpoint (providers rename models constantly). Fix the **Model** field — the error names the model and the base URL it tried. |
 | `*_auth_401` / `403` | Bad or expired API key — re-save it in the popup and press Test. |
 | `ollama_http_403` mentioning `Origin` | Ollama's CORS policy. Restart it with `OLLAMA_ORIGINS='chrome-extension://*'` (see section 3). |
-| `*_rate_limited_429` | Free-tier **per-minute** limit. Concurrency is already lowered and each request is retried with backoff; if 6 posts in a row are refused the batch stops early rather than failing the rest of the library. Wait a minute and press Classify again. |
+| `*_rate_limited_429` | Free-tier **per-minute** limit. The refused post is **not** marked failed — it is re-queued for the same run and every request then waits out a shared ~65 s cool-down so the rest fit inside the next minute window, which is usually all a per-minute cap needs. If the provider still refuses 10 requests in a row the batch stops early rather than failing the rest of the library. |
 | `*_quota_exhausted` | The provider's free quota is used up — a **per-day** cap, which waiting a minute will not fix. The batch aborts immediately (nothing already classified is lost, and untouched posts stay `collected` for a later run). Either wait for the reset and re-run, or switch provider — **Ollama is unmetered**, which is what makes it the right answer for a large library. |
 | `*_no_vision` | That model cannot accept images. Pick a vision-capable model (the Test button tells you before a batch runs). |
 | `*_truncated` | A thinking model spent the whole output budget on reasoning before finishing the JSON. The extension already retries with 4× the budget automatically; if it still happens, choose a non-thinking model or raise `MAX_OUTPUT_TOKENS` in `background.js`. |
@@ -455,10 +588,11 @@ see the state without opening a console. Nothing is changed by diagnosing.
 | I scrolled but nothing was collected | Look at the popup's **Collector:** line, or press **Diagnose state**. It distinguishes the five causes: no Instagram tab open; the content script missing from the tab (reload it with F5, and if it persists set the extension's **Site access** to *On all sites* under Details); the tab not being a Saved page; the grid not having rendered any tiles yet; or the tiles existing but their links no longer looking like post addresses. |
 | Diagnosis says *“45 link(s) on the page, but none is a post address”* | Instagram changed the shape of the links in the saved grid, so the collector cannot tell which posts the tiles belong to. The report prints the actual `href` values and the first tile's markup — paste that back and the link pattern in `parsePostHref` (`content-scripts/collector.js`) needs one more case. The collector already accepts any anchor whose href contains `/p/`, `/reel/`, `/reels/` or `/tv/` **anywhere** in the path, so this only triggers when the grid stops putting a post address in the link at all. |
 | Diagnosis says *“N post(s) found but no thumbnail could be read”* | The tiles are readable but their images had not loaded yet. Thumbnails are recorded as soon as an image appears, so keep scrolling; if it stays at 0, the report's *first tile markup* shows what replaced the `<img>`. |
-| The popup used to say "Idle" while collecting | Fixed: collecting is now its own phase, shown as `collecting` with a running count of recorded posts. |
-| Wall of warnings like `post_may_be_unsaved` | The writer toggled a post out of the library instead of opening the picker. Verify those posts manually — the warning is stored per post. |
-| **It said "Sorted" but my collection is still empty** | Check the Status card's *unconfirmed* line and the run summary (`Sorted 20/20 - 4 unverified`). It means the writer clicked but could not read the collection's state back, so it is no longer counted as proven. To retry those, tick **Re-sort posts that were never confirmed** and press the sort button again — posts that WERE confirmed are still skipped, so nothing gets toggled back out. To find out why they failed, run the **dry run**, or open a post, click its bookmark yourself and press **Inspect the tab I'm on**: the report's *category map* says whether a row for each category is found, and `writeTrace.rowSelector` on each post names the element that was clicked. |
-| Warning `collection_state_unverifiable` | The picker's rows expose no `input[type=checkbox]` and no `aria-checked`, so selection cannot be confirmed even though the click was dispatched. The post is marked written but flagged; the element to inspect is in `writeTrace.rowSelector`. |
+| Sorting stops early: *"every attempt failed at the same step"* | A circuit breaker: several posts in a row failed identically, so the page flow itself is broken and continuing would only churn. The remaining posts stay unsorted and retry on the next run — fix the cause first (the row above, or a dry run). |
+| `save_panel_unreachable (…)` | No route could open the *Save to collection* picker. The error's parenthesised list names **each route that was tried and why it died** — `bookmark hover: timeout_waiting_for_collections_popover_on_hover` means hovering produced no popover, `reveal mounted popover: no mounted Collections popover in the DOM` means there was no popover to reveal, and the plain-language hint after the parenthesised list says whether one exists but could not be made visible. On current builds the picker for an already-saved post is a **CSS-hover popover** (a "Collections" list above the bookmark) that is mounted but hidden; the writer reveals it rather than hovering, and clicks the bookmark only for a post that is not in your library yet. Open a post, hover its bookmark yourself, then press **Inspect the tab I'm on** — the report shows every rung of the panel-detection ladder and the row inventory, and `writeTrace` on each post records which route/strategy won (`panelRevealed`, `openedViaHover`, or a click strategy). |
+| **It said "Sorted" but my collection is still empty** | Check the Status card's *unconfirmed* line and the run summary (`Sorted 20/20 - 4 unverified`). It means the writer clicked but could not read the collection's state back, so it is no longer counted as proven. `writeTrace.selectionSignal` on each post names the signal that was available (or that none was). To retry those, tick **Re-sort posts that were never confirmed** and press the sort button again — posts that WERE confirmed are still skipped, so nothing gets toggled back out. To find out why they failed, run the **dry run**, or open a post, click its bookmark yourself and press **Inspect the tab I'm on**: the report's *category map* says whether a row for each category is found, and `writeTrace.rowSelector` on each post names the element that was clicked. |
+| Warning `collection_state_unverifiable` | The picker's rows expose no `input[type=checkbox]`, no `aria-checked` and no checkmark that differs between rows, so selection cannot be confirmed even though the click was dispatched. The post is marked written but flagged; `writeTrace.selectionSignal` says what was (not) found, and `writeTrace.rowSelector` names the element that was clicked. Open a post, hover its bookmark yourself and press **Inspect the tab I'm on**: the report prints each row plus the selection signal it can read, which is what a build exposing something new will show. |
+| Warning `post_was_unsaved_and_restored` | A bookmark click toggled the post OUT of the saved library during the run and the writer clicked again to put it back (a collection on an unsaved post is meaningless). The write itself succeeded. This should not happen on the current build — the bookmark is only clicked for a post that is *not* in your library. If it appears on every post, run a **dry run** and send the `1b`/`1c` lines. |
 | Warning `collection_created_unconfirmed` | The create-a-collection flow ran but the picker did not list the new row afterwards, so the creation may not have committed. Pre-creating the collections yourself avoids this path entirely (see Step 3). |
 
 Notes on scale: classification is 3 concurrent requests, so ~1000 posts is a long

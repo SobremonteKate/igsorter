@@ -47,6 +47,7 @@ const els = {
   diagMeta: $("diagMeta"),
   diag: $("diag"),
   copyDiag: $("copyDiag"),
+  dismissDiag: $("dismissDiag"),
   stop: $("stop"),
   clear: $("clear"),
   phase: $("phase"),
@@ -303,14 +304,37 @@ function pickReport(state) {
   return candidates[0];
 }
 
+/**
+ * The diagnosis panel renders on every popup refresh from a stored report, so
+ * without bookkeeping of its own it would reappear forever — exactly the spam
+ * the dismiss button exists to stop. Dismissal is tracked per report timestamp:
+ * a NEW diagnosis (a different `at`) shows itself; re-opening the popup does
+ * not resurrect the one you dismissed.
+ */
+let dismissedDiagAt = null;
+let lastDiagnosisReport = null;
+
 function renderDiagnosis(state) {
   const report = state.diagnosis;
   if (!report || !Array.isArray(report.lines)) {
     els.diagWrap.style.display = "none";
     els.diag.textContent = "";
+    els.dismissDiag.style.display = "none";
+    lastDiagnosisReport = null;
+    return;
+  }
+  lastDiagnosisReport = report;
+  // A new diagnosis always overrides any earlier dismissal — including one
+  // made while this very report was being replaced by the in-progress run.
+  if (state.diagnosisJustRan || report.at !== dismissedDiagAt) {
+    dismissedDiagAt = null;
+  }
+  if (dismissedDiagAt === report.at) {
+    els.diagWrap.style.display = "none";
     return;
   }
   els.diagWrap.style.display = "";
+  els.dismissDiag.style.display = "";
   const when = report.at ? new Date(report.at).toLocaleTimeString() : "?";
   const verdict = report.problems
     ? `${report.problems} problem(s) to fix`
@@ -318,7 +342,8 @@ function renderDiagnosis(state) {
       ? `${report.warnings} warning(s), nothing broken`
       : "all clear";
   els.diagMeta.className = report.problems ? "tiny err" : report.warnings ? "tiny warn" : "tiny ok";
-  els.diagMeta.textContent = `${verdict} · ${report.provider || "?"} · ${report.model || "?"} · ${when}`;
+  const unchanged = report.sameAsPrevious ? " · unchanged since last run" : "";
+  els.diagMeta.textContent = `${verdict} · ${report.provider || "?"} · ${report.model || "?"} · ${when}${unchanged}`;
   els.diag.textContent = report.lines.join("\n");
 }
 
@@ -420,6 +445,7 @@ function render(state) {
   renderLog(job);
   renderReport(state);
   renderDiagnosis(state);
+  state.diagnosisJustRan = false;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -720,6 +746,19 @@ els.copyReport.addEventListener("click", () =>
 els.copyDiag.addEventListener("click", () => copyText(els.diag.textContent, els.diag));
 
 /**
+ * Hide the report until the next one runs. Only the panel is hidden: the stored
+ * report is kept so Copy and Diagnose-state still have something to work from,
+ * and the storage watcher's refresh() must not bring it back.
+ */
+els.dismissDiag.addEventListener("click", () => {
+  const report = lastDiagnosisReport;
+  dismissedDiagAt = report ? report.at : Date.now();
+  els.diagWrap.style.display = "none";
+  els.diag.textContent = "";
+  feedback("Diagnosis hidden — press Diagnose state to run a new one.", "warn");
+});
+
+/**
  * Inspect the whole pipeline and print what to do next. Deliberately allowed to
  * run while a job is running: that is exactly when a stuck run needs explaining
  * (it then skips the network test and says so).
@@ -739,7 +778,7 @@ els.diagnose.addEventListener("click", async () => {
     els.diag.textContent = response.error || "Unknown error.";
     return;
   }
-  renderDiagnosis({ diagnosis: response.report });
+  renderDiagnosis({ diagnosis: response.report, diagnosisJustRan: true });
   const report = response.report || {};
   feedback(
     report.problems

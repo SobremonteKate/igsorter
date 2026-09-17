@@ -96,6 +96,16 @@ const PROVIDERS = {
       "X-Title": "IG Saved Sorter"
     }
   },
+  omniroute: {
+    label: "OmniRoute (local gateway, free pools)",
+    baseUrl: "http://localhost:20128/v1",
+    model: "auto",
+    needsKey: false,
+    jsonMode: true,
+    concurrency: 2,
+    keyUrl: null,
+    hint: "Run `npm install -g omniroute` then `omniroute` (window stays open). Dashboard: localhost:20128 — connect free providers there. Model 'auto' routes across all of them."
+  },
   ollama: {
     label: "Ollama (local, no key)",
     baseUrl: "http://localhost:11434/v1",
@@ -991,6 +1001,14 @@ async function callModel(settings, categories, dataUrl) {
     if (error.name === "AbortError") {
       throw new Error(`${settings.provider}_timeout after ${REQUEST_TIMEOUT_MS / 1000}s`);
     }
+    if (error instanceof TypeError && /localhost|127\.0\.0\.1/.test(settings.baseUrl)) {
+      // A refused connection to a local gateway reads as "Failed to fetch",
+      // which says nothing about the actual cause: the gateway is not running.
+      throw new Error(
+        `${settings.provider}_not_running: nothing answered at ${settings.baseUrl}. ` +
+          `Start the gateway first ("omniroute" or "ollama serve" in a terminal, window left open), then press Test.`
+      );
+    }
     throw error;
   } finally {
     clearTimeout(timer);
@@ -1054,10 +1072,26 @@ async function runClassifyJob() {
   // own, but if request after request is refused the pool cannot make progress,
   // and grinding through the rest of the library just marks every post failed.
   let rateLimitStreak = 0;
-  const RATE_LIMIT_STREAK_LIMIT = 6;
+  const RATE_LIMIT_STREAK_LIMIT = 10;
+  //
+  // A free-tier provider limits requests per MINUTE. When a post is refused for
+  // that reason the failure is the schedule's, not the post's: the request was
+  // never scored. Instead of marking the post failed, it is requeued for this
+  // same run and every worker honours a shared cool-down so the remaining
+  // requests fit inside the next minute window. A per-DAY quota is different -
+  // no pacing recovers it - so providerError() raises a fatal error for that
+  // case and the batch aborts with nothing marked failed.
+  let cooldownUntil = 0;
+  const RATE_LIMIT_COOLDOWN_MS = 65000;
 
   await runPool(pending, settings.concurrency, async (post) => {
     try {
+      // Honour the shared cool-down after a per-minute refusal. Read fresh here
+      // rather than sleeping once, so a requeued post cannot start early just
+      // because another worker reset the clock after it queued.
+      const wait = cooldownUntil - Date.now();
+      if (wait > 0) await sleep(wait + rand(0, 1500));
+
       if (!post.thumbnailUrl) throw new PermanentError("no_thumbnail");
       const { category, confidence, warning } = await classifyOne(post, settings, categories);
       rateLimitStreak = 0;
@@ -1097,6 +1131,20 @@ async function runClassifyJob() {
         rateLimitStreak = /rate_limited_429|quota_exhausted/.test(message)
           ? rateLimitStreak + 1
           : 0;
+        if (/_rate_limited_429/.test(message)) {
+          // Per-minute refusal: requeue this post and pace the whole pool.
+          // The post is NOT marked failed - its classification simply has not
+          // happened yet, and it will be retried later in this same run.
+          const index = pending.indexOf(post);
+          if (index >= 0) pending.push(post);
+          cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          await pushLog(
+            "warn",
+            `${post.shortcode}: per-minute limit hit - requeued, waiting ~${Math.round(
+              RATE_LIMIT_COOLDOWN_MS / 1000
+            )}s before the next request`
+          );
+        }
         if (rateLimitStreak >= RATE_LIMIT_STREAK_LIMIT && !fatal) {
           fatal = `${message} (stopped early: ${rateLimitStreak} posts in a row were refused)`;
           runtime.stop = true;
@@ -1119,8 +1167,11 @@ async function runClassifyJob() {
   const stopped = await isStopRequested();
   await endJob(
     stopped
-      ? `Stopped after classifying ${done - failures}/${pending.length}`
-      : `Classified ${done - failures}/${pending.length} post(s)` +
+      ? `Stopped after classifying ${Math.min(done - failures, pending.length)}/${pending.length}` +
+          (rateLimitStreak >= RATE_LIMIT_STREAK_LIMIT
+            ? " - the provider kept refusing requests"
+            : "")
+      : `Classified ${Math.min(done - failures, pending.length)}/${pending.length} post(s)` +
           (failures ? ` - ${failures} failed (click Classify again to retry)` : "")
   );
 }
@@ -1344,7 +1395,19 @@ function dryRunReportSummary(result) {
   const gated = steps.filter(
     (step) => step.status === "SKIPPED" || step.status === "NOT-OPEN"
   ).length;
-  return `save icon ok - ${resolved} step(s) resolved, ${missed} miss, ${gated} gated behind a click`;
+  // The single most useful fact in one line: did the hover (the route current
+  // builds need) open the picker, and if not, was a popover at least present but
+  // hidden, or absent entirely?
+  const hoverStep = steps.find((step) => step.step.startsWith("1b."));
+  const hiddenStep = steps.find((step) => step.step.startsWith("1c."));
+  const picker = hoverStep && hoverStep.status === "RESOLVED"
+    ? "picker opened by hovering the bookmark"
+    : hiddenStep && hiddenStep.status === "RESOLVED"
+      ? "picker was mounted but CSS-hidden; the writer reveals it instead of hovering"
+      : hiddenStep && hiddenStep.status === "MISS"
+        ? "picker is mounted but could not be revealed - the run will fail here"
+        : "no picker in the DOM (real pointer hover only)";
+  return `${picker} - ${resolved} step(s) resolved, ${missed} miss, ${gated} gated behind a click`;
 }
 
 /** Store a probe report on the post without touching its pipeline status. */
@@ -1364,7 +1427,9 @@ function recordDryRunReport(post, result, summary) {
       url: (result && result.url) || postUrl(post),
       panelOpen: !!(result && result.panelOpen),
       summary,
-      lines: ((result && result.lines) || []).slice(0, 40)
+      // 80 lines rather than 40: the hover probe and the row inventory push the
+    // actionable steps (row match, click target, category map) past line 40.
+    lines: ((result && result.lines) || []).slice(0, 80)
     };
   });
 }
@@ -1416,6 +1481,21 @@ async function runWritebackJob(options = {}) {
   let failures = 0;
   let inspected = 0;
   let problems = 0;
+  // Which picker route each post actually used (hover popover / ⋯ menu /
+  // bookmark click). Rolled up into one log line at the end instead of one line
+  // per post, so a 500-post sort cannot push everything else out of the log.
+  const routeCounts = {};
+  // If several posts in a row fail at the SAME step, the page flow itself is
+  // broken (a deploy moved the picker), and grinding on just churns through the
+  // library and looks like automation. The phase stops with an explanation;
+  // failed posts retry on the next run of the same button.
+  let identicalFailures = 0;
+  let lastFailure = null;
+  const WRITE_FAILURE_BREAKER = 6;
+  // Strip the retry suffix so "timeout_waiting_for_panel_retry" and
+  // "timeout_waiting_for_panel" count as the same broken step.
+  const failureSignature = (message) =>
+    String(message).replace(/_retry.*$/, "");
   // Clicked, but the writer could not read the collection's state back. Counted
   // separately from both success and failure: claiming these are "sorted" is how
   // a run reports 20/20 while Instagram shows nothing.
@@ -1470,7 +1550,34 @@ async function runWritebackJob(options = {}) {
             if (result.warning) target.warning = result.warning;
           }
         });
-        if (result.warning) await pushLog("warn", `${post.shortcode}: ${result.warning}`);
+        /*
+         * One line per post that names HOW it was written, so the popup log
+         * answers "which route worked and what did it click?" without a
+         * DevTools trip: hover / ⋯menu / click, the row selector the writer
+         * acted on, and the signal it read the selection state from.
+         */
+        const trace = result.trace || {};
+        const route = trace.panelRevealed
+          ? "popover revealed (CSS :hover build)"
+          : trace.openedViaHover
+            ? "hover popover"
+            : trace.openedViaMenu
+              ? "⋯ menu"
+              : "bookmark click";
+        routeCounts[route] = (routeCounts[route] || 0) + 1;
+        // Only the posts that need attention get their own line; the routine
+        // case is the roll-up at the end of the run.
+        if (!result.confirmed || result.warning) {
+          const facts = [route];
+          if (trace.rowSelector) facts.push(`row=${trace.rowSelector}`);
+          if (trace.selectionSignal) facts.push(`state=${trace.selectionSignal}`);
+          await pushLog(
+            "warn",
+            `${post.shortcode}: "${post.category}" ${result.confirmed ? "confirmed" : "UNCONFIRMED"}` +
+              (result.warning ? ` (${result.warning})` : "") +
+              ` - ${facts.join(", ")}`
+          );
+        }
       }
     } catch (error) {
       const message = String((error && error.message) || error);
@@ -1494,6 +1601,25 @@ async function runWritebackJob(options = {}) {
           }
         });
         await pushLog("error", `${post.shortcode}: ${message}`);
+
+        // Circuit breaker: the same failure over and over means the page flow
+        // is broken, not the posts. Stop rather than churn through the rest.
+        const signature = failureSignature(message);
+        if (signature === lastFailure) identicalFailures++;
+        else {
+          identicalFailures = 1;
+          lastFailure = signature;
+        }
+        if (identicalFailures >= WRITE_FAILURE_BREAKER) {
+          const remaining = pending.length - (i + 1);
+          await pushLog(
+            "warn",
+            `Stopping: ${identicalFailures} posts in a row failed with "${signature}". ` +
+              `The remaining ${remaining} post(s) were not attempted - they stay unsorted and retry next run. ` +
+              'Use "Inspect the tab I\'m on" on one of these posts to see which step no longer matches Instagram.'
+          );
+          break;
+        }
       }
     } finally {
       if (tabId != null) {
@@ -1535,6 +1661,10 @@ async function runWritebackJob(options = {}) {
     );
     return;
   }
+  const routeSummary = Object.entries(routeCounts)
+    .map(([route, count]) => `${count}× ${route}`)
+    .join(", ");
+  if (routeSummary) await pushLog("info", `Picker routes used: ${routeSummary}`);
   if (unconfirmed) {
     await pushLog(
       "warn",
@@ -1547,7 +1677,10 @@ async function runWritebackJob(options = {}) {
       ? `Stopped after sorting ${written}/${pending.length}`
       : `Sorted ${written}/${pending.length} post(s)` +
           (unconfirmed ? ` - ${unconfirmed} unverified` : "") +
-          (failures ? ` - ${failures} failed (click Sort again to retry)` : "")
+          (failures ? ` - ${failures} failed (click Sort again to retry)` : "") +
+          (identicalFailures >= WRITE_FAILURE_BREAKER
+            ? " - stopped early: every attempt failed at the same step"
+            : "")
   );
 }
 
@@ -2031,6 +2164,31 @@ async function handleMessage(message, sender) {
     // Full state inspection with a plain-language plan for what to do next.
     case "DIAGNOSE": {
       const report = await runDiagnosis(message.fallbackImage);
+      // Re-running to check a fix should not re-shout the same verdict. When
+      // the findings are equivalent to the previous run, stamp it as such (the
+      // popup's meta line reads it) instead of looking like fresh spam.
+      // Only the volatile numbers are normalised away - the latency and
+      // confidence inside the Reachability check drift on every run. Counts
+      // elsewhere ("12 post(s) collected") are findings and must stay literal,
+      // so collecting more posts between runs still reads as a change.
+      const previous = (await chrome.storage.local.get(KEYS.diagnosis))[KEYS.diagnosis];
+      const normalizeCheck = (check) =>
+        JSON.stringify({
+          ...check,
+          title: /^Reachability:/.test(check.title || "")
+            ? check.title.replace(/\d+/g, "#")
+            : check.title,
+          detail: /^answered/.test(check.detail || "")
+            ? check.detail.replace(/\d+/g, "#")
+            : check.detail
+        });
+      const signature = (report) => JSON.stringify({
+        problems: report.problems,
+        warnings: report.warnings,
+        checks: (report.checks || []).map(normalizeCheck),
+        nextSteps: report.nextSteps
+      });
+      report.sameAsPrevious = !!(previous && previous.checks && signature(previous) === signature(report));
       await chrome.storage.local.set({ [KEYS.diagnosis]: report });
       return { ok: true, report };
     }

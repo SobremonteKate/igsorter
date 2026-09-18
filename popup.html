@@ -198,6 +198,19 @@
         <input id="resortUnconfirmed" type="checkbox" />
         <span>Re-sort posts that were never confirmed</span>
       </label>
+      <div>
+        <label for="tabFocus">Post tabs while sorting</label>
+        <select id="tabFocus">
+          <option value="on-failure">Bring to the front on failure (recommended)</option>
+          <option value="never">Keep in the background - quietest</option>
+          <option value="always">Always watch each post</option>
+        </select>
+        <div class="tiny muted" style="margin-top: 4px">
+          Chrome throttles tabs you are not looking at, and Instagram renders less
+          offscreen, so a hidden tab fails more often. "On failure" retries a failed
+          post with its tab in front, then keeps the rest of the run there.
+        </div>
+      </div>
       <button id="inspect" class="small ghost">Inspect the tab I'm on (no clicks)</button>
       <div class="row between">
         <button id="stop" class="small ghost">Stop</button>
@@ -224,10 +237,22 @@
       <button id="diagnose" class="small ghost" style="width: 100%; margin-top: 6px">
         Diagnose state · runs 1 test request
       </button>
+      <button id="auditToggle" class="small ghost" style="width: 100%; margin-top: 6px">
+        Per-post audit
+      </button>
       <div id="openWrap" class="tiny" style="margin-top: 6px; display: none">
         <a id="openSaved" href="#" target="_blank" rel="noreferrer">Open your Saved page in a new tab →</a>
         <div class="muted">Instagram never scrolls itself — you drive the collection phase.</div>
       </div>
+    </section>
+
+    <section id="auditWrap" style="display: none">
+      <div class="row between">
+        <label style="margin: 0">Per-post audit</label>
+        <button id="copyAudit" class="small">Copy</button>
+      </div>
+      <div id="auditMeta" class="tiny muted" style="margin: 4px 0 6px"></div>
+      <pre id="auditText"></pre>
     </section>
 
     <section id="reportWrap" style="display: none">

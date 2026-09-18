@@ -138,9 +138,23 @@ const LONG_PAUSE_MAX_MS = 20000;
 const TAB_LOAD_TIMEOUT_MS = 30000;
 const TAB_SETTLE_MS = 1500;
 
-// Some builds throttle rendering of fully hidden tabs. If the writer keeps
-// timing out waiting for the bookmark icon, flip this to true.
-const WRITE_TABS_ACTIVE = false;
+/*
+ * How each post's tab is opened during the sort.
+ *
+ * Chrome throttles timers in tabs nobody is looking at (a `setTimeout(150)`
+ * really fires after ~1000ms there) and does not render some offscreen UI, so a
+ * hidden tab fails more often than a watched one - a run started while you
+ * scroll elsewhere used to fail while the same run watched worked.
+ *
+ *   "never"      every tab stays in the background: quietest, but the most
+ *                failures, which the writer can only partly compensate for.
+ *   "on-failure" start hidden, and the moment a post fails while its tab was in
+ *                the background, retry that post with the tab in front and keep
+ *                the rest of the run there. (default)
+ *   "always"     every post's tab opens in front, so you watch the whole run.
+ */
+const TAB_FOCUS_DEFAULT = "on-failure";
+const TAB_FOCUS_VALUES = ["never", "on-failure", "always"];
 
 const LOG_LIMIT = 200;
 
@@ -240,7 +254,10 @@ async function getSettings() {
     dryRun: !!stored.dryRun,
     // Every setting must be listed here: this object is a whitelist, and a field
     // missing from it is silently always-undefined no matter what the popup saved.
-    resortUnconfirmed: !!stored.resortUnconfirmed
+    resortUnconfirmed: !!stored.resortUnconfirmed,
+    tabFocus: TAB_FOCUS_VALUES.includes(stored.tabFocus)
+      ? stored.tabFocus
+      : TAB_FOCUS_DEFAULT
   };
 }
 
@@ -272,10 +289,22 @@ async function setSettings(patch) {
     const stored = data[KEYS.settings] || {};
     const next = { ...stored };
 
-    for (const key of ["provider", "baseUrl", "categories", "dryRun", "resortUnconfirmed"]) {
+    for (const key of [
+      "provider",
+      "baseUrl",
+      "categories",
+      "dryRun",
+      "resortUnconfirmed",
+      "tabFocus"
+    ]) {
       if (patch[key] !== undefined) next[key] = patch[key];
     }
     if (Array.isArray(next.categories)) next.categories = sanitizeCategories(next.categories);
+    // An unknown value would silently behave like the default; drop it so the
+    // stored settings only ever hold a value the popup can also render.
+    if (next.tabFocus !== undefined && !TAB_FOCUS_VALUES.includes(next.tabFocus)) {
+      delete next.tabFocus;
+    }
 
     const provider = PROVIDERS[next.provider] ? next.provider : DEFAULT_PROVIDER;
 
@@ -315,7 +344,8 @@ async function publicSettings() {
     apiKey: settings.apiKey,
     needsKey: settings.needsKey,
     categories: settings.categories,
-    dryRun: settings.dryRun
+    dryRun: settings.dryRun,
+    tabFocus: settings.tabFocus
   };
 }
 
@@ -1312,6 +1342,44 @@ async function writePostToCollection(tabId, post, options = {}) {
   return (injection && injection.result) || { success: false, error: "no_result" };
 }
 
+/**
+ * Load one post's page in its own tab, run the writer there, and always close
+ * the tab again.
+ *
+ * Split out of the batch loop so the same post can be retried with the tab moved
+ * to the front when a background tab turned out to be the reason it failed.
+ * `active: true` alone is not always enough to get a rendering tab: Chrome also
+ * treats tabs as hidden while their window is minimised or completely covered,
+ * so the window is focused too. Failures to load the page throw (they are not a
+ * writer verdict), everything else comes back as the writer's result object.
+ */
+async function drivePost(post, { dryRun, active }) {
+  const tab = await chrome.tabs.create({ url: postUrl(post), active });
+  const tabId = tab.id;
+  try {
+    if (active && tab.windowId != null) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch {
+        /* focusing is best-effort; the page still reports whether it worked */
+      }
+    }
+    const loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+    if (!loaded.ok) throw new Error(`post_page_${loaded.reason}`);
+
+    // Give the React app a moment to hydrate before the writer starts polling.
+    await sleep(TAB_SETTLE_MS + rand(0, 800));
+
+    return await writePostToCollection(tabId, post, { dryRun });
+  } finally {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch {
+      /* tab already closed by the user */
+    }
+  }
+}
+
 /* ------------------------------------------------------------------------- *
  * Dry-run probe against the tab the user is already looking at
  *
@@ -1384,6 +1452,20 @@ async function probeTab({ tabId, url, category }) {
   return { ok: true, report };
 }
 
+/**
+ * Did this writer/probe result come from a tab nobody was looking at?
+ *
+ * The writer reports it two ways: inside `trace` for a real write, at the top
+ * level for the non-destructive probe. Either one counts, because Chrome
+ * throttles hidden tabs and Instagram renders less offscreen - so a failure
+ * there is not evidence about the page.
+ */
+function resultWasHidden(result) {
+  if (!result) return false;
+  if (result.trace && result.trace.pageHidden === true) return true;
+  return result.pageHidden === true;
+}
+
 /** One-line verdict for a probe report, used in the log and the popup. */
 function dryRunReportSummary(result) {
   if (!result) return "no report";
@@ -1407,7 +1489,10 @@ function dryRunReportSummary(result) {
       : hiddenStep && hiddenStep.status === "MISS"
         ? "picker is mounted but could not be revealed - the run will fail here"
         : "no picker in the DOM (real pointer hover only)";
-  return `${picker} - ${resolved} step(s) resolved, ${missed} miss, ${gated} gated behind a click`;
+  const hidden = resultWasHidden(result)
+    ? " - ran in a BACKGROUND tab (Instagram renders less offscreen): a MISS here is not proof the writer is broken"
+    : "";
+  return `${picker} - ${resolved} step(s) resolved, ${missed} miss, ${gated} gated behind a click${hidden}`;
 }
 
 /** Store a probe report on the post without touching its pipeline status. */
@@ -1500,26 +1585,55 @@ async function runWritebackJob(options = {}) {
   // separately from both success and failure: claiming these are "sorted" is how
   // a run reports 20/20 while Instagram shows nothing.
   let unconfirmed = 0;
+  // Tab visibility bookkeeping (see TAB_FOCUS_DEFAULT). `foreground` flips to
+  // true the first time a post fails while its tab was in the background, and
+  // stays true for the rest of the run - the posts that follow would fail the
+  // same way.
+  let foreground = settings.tabFocus === "always";
+  const foregroundOnFailure = settings.tabFocus === "on-failure";
+  const maxAttempts = settings.tabFocus === "never" ? 1 : 2;
+  let hiddenFailures = 0;
+  let switchedToForeground = false;
+  let stillHiddenInFront = 0;
+  // Posts whose page reported itself as hidden at all (they usually still work;
+  // this is the number that explains a run which behaved differently from the
+  // same run with the browser watched).
+  let hiddenRuns = 0;
 
   for (let i = 0; i < pending.length; i++) {
     if (await isStopRequested()) break;
     const post = pending[i];
-    let tabId = null;
 
     try {
-      const tab = await chrome.tabs.create({
-        url: postUrl(post),
-        active: WRITE_TABS_ACTIVE
-      });
-      tabId = tab.id;
-
-      const loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
-      if (!loaded.ok) throw new Error(`post_page_${loaded.reason}`);
-
-      // Give the React app a moment to hydrate before the writer starts polling.
-      await sleep(TAB_SETTLE_MS + rand(0, 800));
-
-      const result = await writePostToCollection(tabId, post, { dryRun });
+      /*
+       * Try the post the quiet way first, then once more with the tab in front
+       * if the failure was caused by the page being hidden. A hidden failure
+       * (writer reports pageHidden) says nothing about the post: Chrome throttles
+       * that tab's timers and Instagram may skip rendering offscreen UI.
+       */
+      let result = null;
+      for (let attempt = 1; ; attempt++) {
+        result = await drivePost(post, { dryRun, active: foreground });
+        // A probe reports `ok`, a real write reports `success`; both can fail
+        // because the tab was hidden rather than because the page changed.
+        const failed = dryRun ? !!result && result.ok === false : !!result && !result.success;
+        if (!failed || !resultWasHidden(result)) break;
+        if (attempt === 1) hiddenFailures++;
+        if (!foregroundOnFailure || attempt >= maxAttempts) break;
+        foreground = true;
+        switchedToForeground = true;
+        await pushLog(
+          "warn",
+          `${post.shortcode}: failed while its tab was in the background - bringing the tab to the front and retrying this post`
+        );
+      }
+      // Report visibility honestly, in both directions. A page that says it is
+      // hidden while we are supposedly in front means the window is minimised or
+      // completely covered by another window, which is the one thing bringing
+      // the tab to the front cannot fix.
+      const wasHidden = resultWasHidden(result);
+      if (wasHidden) hiddenRuns++;
+      if (foreground && wasHidden) stillHiddenInFront++;
 
       if (dryRun) {
         // Dry run: keep the report, leave the pipeline status untouched, and
@@ -1531,7 +1645,16 @@ async function runWritebackJob(options = {}) {
         await pushLog(result && result.ok ? "info" : "warn", `${post.shortcode}: ${summary}`);
       } else {
         if (!result || !result.success) {
-          throw new Error((result && result.error) || "write_failed");
+          /*
+           * Carry the writer's trace out with the failure. The trace is what the
+           * popup's per-post audit renders (route used, rows seen, controls
+           * considered, the step that died), and until now it was thrown away with
+           * the error message - which is why a failed run could only be read as
+           * one line per post.
+           */
+          const failure = new Error((result && result.error) || "write_failed");
+          failure.trace = (result && result.trace) || null;
+          throw failure;
         }
         written++;
         if (!result.confirmed) unconfirmed++;
@@ -1598,6 +1721,8 @@ async function runWritebackJob(options = {}) {
             target.status = "failed";
             target.error = message;
             target.failedStage = "write";
+            // Kept so the failure can be audited post by post in the popup.
+            target.writeTrace = (error && error.trace) || target.writeTrace || null;
           }
         });
         await pushLog("error", `${post.shortcode}: ${message}`);
@@ -1619,14 +1744,6 @@ async function runWritebackJob(options = {}) {
               'Use "Inspect the tab I\'m on" on one of these posts to see which step no longer matches Instagram.'
           );
           break;
-        }
-      }
-    } finally {
-      if (tabId != null) {
-        try {
-          await chrome.tabs.remove(tabId);
-        } catch {
-          /* tab already closed by the user */
         }
       }
     }
@@ -1655,9 +1772,12 @@ async function runWritebackJob(options = {}) {
   const stopped = await isStopRequested();
   if (dryRun) {
     await endJob(
-      stopped
+      (stopped
         ? `Dry run stopped after ${inspected}/${pending.length} post(s)`
-        : `Dry run: ${inspected} post(s) inspected, ${problems} need attention - nothing was clicked`
+        : `Dry run: ${inspected} post(s) inspected, ${problems} need attention - nothing was clicked`) +
+        (hiddenRuns
+          ? ` - ${hiddenRuns} of them ran in a background tab, where Instagram renders less: a MISS there is not proof the writer is broken`
+          : "")
     );
     return;
   }
@@ -1672,12 +1792,34 @@ async function runWritebackJob(options = {}) {
         'Open one of them on Instagram to check, then use the dry run (or "Inspect the tab I\'m on") to see which element the writer clicks for the collection row.'
     );
   }
+  if (hiddenFailures) {
+    await pushLog(
+      "warn",
+      `${hiddenFailures} post(s) failed while their tab was in the background. ` +
+        (settings.tabFocus === "never"
+          ? 'Chrome throttles background tabs and Instagram skips rendering some offscreen UI, so that is expected - set "Post tabs" to "Bring to the front on failure" to retry them.'
+          : "They were retried with the tab brought to the front.")
+    );
+  }
+  if (switchedToForeground) {
+    await pushLog(
+      "info",
+      "The rest of this run kept each post's tab in front, because the background tab was the reason for the failure. Set \"Post tabs\" to \"Never\" if you would rather the run stayed quiet."
+    );
+  }
+  if (stillHiddenInFront) {
+    await pushLog(
+      "warn",
+      `${stillHiddenInFront} post(s) still reported themselves as hidden with the tab in front - the Chrome window is probably minimised or completely covered by another window. Chrome does not render tabs in that state, so keep the window where it can be seen.`
+    );
+  }
   await endJob(
     stopped
       ? `Stopped after sorting ${written}/${pending.length}`
       : `Sorted ${written}/${pending.length} post(s)` +
           (unconfirmed ? ` - ${unconfirmed} unverified` : "") +
           (failures ? ` - ${failures} failed (click Sort again to retry)` : "") +
+          (hiddenRuns && !foreground ? ` - ${hiddenRuns} ran hidden` : "") +
           (identicalFailures >= WRITE_FAILURE_BREAKER
             ? " - stopped early: every attempt failed at the same step"
             : "")
@@ -1833,6 +1975,15 @@ async function runDiagnosis(fallbackImage) {
   const legacyWrites = posts.filter(
     (post) => post.status === "written" && post.writtenConfirmed === undefined
   ).length;
+  // Failures the writer itself attributed to the tab being in the background.
+  // Worth separating, because those say nothing about the page - the fix is the
+  // "Post tabs" setting, not a selector (see [page_hidden]).
+  const hiddenWriteFailures = posts.filter(
+    (post) =>
+      post.status !== "written" &&
+      ((post.failedStage === "write" && /\[page_hidden\]/.test(post.error || "")) ||
+        (post.writeTrace && post.writeTrace.pageHidden === true))
+  ).length;
 
   if (!total) {
     add("warn", "No posts collected yet", "nothing has been recorded from your Saved page");
@@ -1871,8 +2022,19 @@ async function runDiagnosis(fallbackImage) {
       add("info", `${dryRunWrites} post(s) have only been dry-run inspected`, "nothing was clicked for those");
     }
     if (failedWrite) {
-      add("warn", `${failedWrite} failed during write-back`);
+      add(
+        "warn",
+        `${failedWrite} failed during write-back`,
+        hiddenWriteFailures
+          ? `${hiddenWriteFailures} of them in a background tab, where Chrome throttles timers and Instagram renders less`
+          : null
+      );
       nextSteps.push('Re-run "3 · Sort Into Collections" - already-sorted posts are skipped, failures are retried.');
+      if (hiddenWriteFailures) {
+        nextSteps.push(
+          `${hiddenWriteFailures} of those failures were tagged [page_hidden]: their tab was in the background, so they say nothing about the page. Keep "Post tabs" on its default (the first hidden failure is retried in front) or set it to "Always watch each post".`
+        );
+      }
     }
     if (noThumbnail) add("info", `${noThumbnail} post(s) had no usable thumbnail (skipped by design)`);
     if (lowConfidence) {

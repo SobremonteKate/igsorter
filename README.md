@@ -9,7 +9,7 @@ It works in three phases that you drive from the popup:
 | --- | --- | --- |
 | **1 · Start Collecting** | A content script passively records every saved-post tile you scroll past (shortcode + thumbnail URL). | **You** — scroll your Saved page manually. |
 | **2 · Classify Collected Posts** | The background worker sends each thumbnail to the DeepSeek vision model and stores the resulting category + confidence. | The extension. |
-| **3 · Sort Into Collections** | For every classified post the worker opens a background tab, opens the *Collections* popover (it is mounted but CSS-hidden, so the writer reveals it), selects (or creates) the matching collection, then closes the tab. | The extension. |
+| **3 · Sort Into Collections** | For every classified post the worker opens a tab (in front or in the background, per the **Post tabs** setting), opens the *Collections* popover (it is mounted but CSS-hidden, so the writer reveals it), selects (or creates) the matching collection, then closes the tab. | The extension. |
 
 The extension **never** reads, stores or transmits your Instagram password. Phase 3
 reuses the session cookies your browser already has, exactly as if you had clicked
@@ -101,10 +101,18 @@ demand with `chrome.scripting.executeScript({ files: [...] })`.
 ### Step 3 — “Sort Into Collections”
 
 * For each classified post that is not yet written: opens
-  `https://www.instagram.com/reel/<shortcode>/` (or `/p/`) in an **inactive** tab,
-  waits for it to load, injects `writer.js`, opens the collection picker, selects
-  the matching row (creating the collection if it doesn't exist), then closes the
-  tab.
+  `https://www.instagram.com/reel/<shortcode>/` (or `/p/`) in its own tab, waits for
+  it to load, injects `writer.js`, opens the collection picker, selects the matching
+  row (creating the collection if it doesn't exist), then closes the tab. Whether
+  that tab is **in front** or in the background is the **Post tabs** setting:
+  * **Bring to the front on failure** (default) — tabs start hidden, and the first
+    time a post fails because its tab was hidden, that post is retried with its tab
+    in front (and the Chrome window focused), and the rest of the run stays there.
+    This is the setting to leave alone unless the focus changes bother you.
+  * **Keep in the background** — the quietest option. More posts fail, and the run
+    spells out which ones and why.
+  * **Always watch each post** — every tab opens in front, so you watch the whole
+    run go by.
 * **The picker's reveal is pure CSS `:hover`, which no scripted event can
   produce — so the writer does not try to hover.** Hovering the bookmark shows a
   *Collections* list above it; clicking it on an already-saved post only toggles the
@@ -126,22 +134,79 @@ demand with `chrome.scripting.executeScript({ files: [...] })`.
 * The panel is found by a ladder (dialog mentioning save/collection, dialog
   containing checkboxes, **the “Collections” popover — header plus its rows, no
   checkbox controls required**, that same popover force-revealed when it is mounted
-  but hidden, or any visible container holding a group of 2+ checkboxes). The
+  but hidden, or any visible container holding a group of 2+ checkboxes).
+* **A popover whose only entry is “Add collection” is a doorway, not the picker.**
+  Hovering the bookmark on this build shows a small *Collections* popover whose
+  whole content is one *Add collection* item — the list of collections is one click
+  behind it. Measured from a real run's per-post audit (5 posts, every one
+  identical): `rows seen "add collection"`, `control(s) div(add collection)
+  svg[Add collection](add collection)`, and no create control, because the wording
+  is neither *New collection* nor “+”. The writer now recognises that shape and
+  **clicks the doorway, then waits for the panel it opens** (a dialog with the
+  collection rows and a *New collection* entry), matching your category there — so
+  it reaches the real picker instead of reporting a missing create button. It only
+  counts as a doorway when the panel has **no collection rows at all**, so a real
+  picker that also offers *Add collection* in its header is never clicked through
+  (there is a harness case for exactly that). If the click opens nothing, the error
+  says so (`timed out waiting for the collection panel after add collection`) rather
+  than blaming the create control.
+* **A reveal is only accepted when the picker's *contents* become usable**, not
+  when the container merely measures more than 0×0 — and not when *some* descendant
+  merely has text. Instagram keeps this popover
+  mounted with an inner wrapper collapsed, and it hides the rows and the header's
+  create control with a `:hover`-scoped rule that no scripted event can satisfy —
+  so “the container is visible” can be true while every row and every control
+  inside it is still zero-sized. The popover's *title* is always visible, so “any
+  text inside” would have been satisfied by the word “Collections” alone: readiness
+  now means **a collection row is readable, or the create control is usable**. The
+  reveal escalates in three passes (hide it →
+  collapse it → **the container has a size but its contents are collapsed**, in
+  which case the subtree itself is fixed) and reverts every property it touched
+  when the panel closes. Inside a popover that was revealed this way, rows and
+  controls count as usable even while Instagram keeps them at 0×0: a dispatched
+  click does not need geometry, because React listens at the root rather than at
+  the coordinates. Outside a revealed popover the strict rule is kept, so an
+  ambient hidden overlay can never be clicked into. The
   popover is identified as the **deepest** container whose text starts with
   “Collections” and which holds row labels: its wrappers contain the same text and
   are deliberately never adopted (a wrapper looks like a visible panel with no rows
-  in it, which is how the writer used to end up clicking nothing). The row to click
-  is the deepest clickable that carries the category's label, never an outer
-  wrapper. When all routes miss, the error names **every** dead end and why, e.g.
+  in it, which is how the writer used to end up clicking nothing). The popover's own
+  title is never treated as a collection row: it is the *first* such label inside
+  the popover, and anything positional built on the row list — the header's create
+  control, for one — would otherwise go looking above it. The row to click is the
+  deepest clickable that carries the category's label, never an outer wrapper.
+* **Creating a collection searches by scope as well as by wording**, because this
+  is the one control builds differ on most: a dialog has a “New collection” button,
+  the hover popover has a bare “+” in its header, and on some builds that header is
+  a *sibling* of the node adopted as the panel. The ladder is: exact text, then
+  aria-label, then the panel's own parent and grandparent when those still look like
+  the popover, then — last — **the last icon-bearing control that comes before the
+  first row**, which is where the “+” sits on every build seen so far. The post's own
+  action controls (Save, Like, Share, ⋯) are excluded from every rung, and the
+  structural rung is refused outright when the picker shows no rows, since then
+  there is no header to be looking in. When all routes miss, the error names **every** dead end and why, e.g.
   `save_panel_unreachable (reveal mounted popover: no mounted Collections popover in
   the DOM; bookmark hover: timeout_waiting_for_collections_popover_on_hover) - no
   Collections popover exists in the DOM on this page, …`.
 * After clicking a row the writer reads the selection back — `input.checked`,
   then `aria-checked`, then a checkmark icon, in that order — and a click whose
   result cannot be read is reported as **unconfirmed**, not as sorted. If the
-  popover closes or unmounts on the click, it is re-opened (revealed again) and read
+  popover closes or unmounts on the click, it is re-opened (revealed again, or
+  re-hovered — see below) and read
   from there, which is stronger evidence than watching a stale element. The read method is stored
   per post in `writeTrace.selectionSignal`.
+* **The hover is two-phase: plain first, leave-first retry second.** React
+  derives enter/leave from the event stream and ignores an enter for a node it
+  already believes the pointer is inside. Two real runs measured the two ways
+  to get this wrong: a leave dispatched *before* the first enter dismissed the
+  popover outright on the live build (hover matched 0 of 12 posts — "it just
+  closes the tab and never clicks"), while *no* leave anywhere meant a click's
+  bubbling events deduped the *second* enter, so post-click verification could
+  not re-open the picker ("the row could not be found again after the click" on
+  every post). The writer now hovers plainly first — the route that worked —
+  and only when nothing appeared dispatches one leave sequence and hovers
+  again, which is what a real pointer arriving from elsewhere produces. Both
+  phases run inside every hover-based route and in the dry-run probe.
 * The log gets a line **only for the posts that need attention** (unconfirmed, or
   carrying a warning) plus one roll-up at the end of the run:
   `Picker routes used: 20× popover revealed (CSS :hover build), 1× hover popover`.
@@ -159,8 +224,19 @@ demand with `chrome.scripting.executeScript({ files: [...] })`.
   never confirmed** to bring those back, which is how you recover anything an older
   build claimed to sort. Confirmed posts are never re-clicked, because clicking a
   collection that already contains the post removes it again.
-* Leave the browser focused on something else while this runs — Instagram's UI
-  still works in background tabs, but the tabs do appear in your tab strip.
+* **Background tabs are second-class citizens in Chrome, and the extension can
+  only partly compensate.** A tab nobody is looking at has its timers throttled — a
+  `setTimeout(150)` really fires after ~1000 ms — and Instagram skips rendering some
+  offscreen UI, which is why the same run used to fail while you scrolled elsewhere
+  and work when you watched it. The writer handles the timer half by **measuring the
+  clamp** and waiting on **DOM changes** instead of sleeping (a background tab now
+  resolves a wait at DOM speed, and a 900 ms budget makes several looks instead of
+  two); background.js handles the rendering half by retrying a hidden-tab failure
+  with the tab in front. What no code can fix is a Chrome window that is
+  **minimised or completely covered by another window**: Chrome reports those tabs as
+  hidden too and does not render them, and the run says so explicitly when it
+  happens. Failures caused by a hidden tab are tagged `[page_hidden]`, so they are
+  never mistaken for Instagram changing its DOM.
 * **Tick “Dry run” first** if you have never run this: it performs the whole phase
   without clicking anything (see the next section).
 
@@ -306,7 +382,9 @@ Two gotchas:
 Instagram's markup changes without notice, so the sort phase has an inspect-only
 mode. Tick **Dry run** under the third button (the button relabels itself to
 *3 · Dry-Run Sort (no clicks)*) and press it: the extension opens each post in a
-background tab and reports **which element each step would act on** — without
+background tab (the dry run follows the **Post tabs** setting too, so set it to
+*Always watch each post* when you want a probe of a fully rendered page) and reports
+**which element each step would act on** — without
 dispatching a single click. Statuses stay `classified`, so nothing looks sorted.
 
 The probe first **hovers the bookmark** (step `1b`). Hovering changes nothing on
@@ -362,6 +440,47 @@ confirm your category names line up with your existing collections.
 Reports appear in the popup (newest first, one per post), can be **copied** with
 the Copy button, and the log gets a one-line verdict per post, for example:
 
+### After a run: the per-post audit
+
+**Per-post audit (N)** in the Status card opens a post-by-post read-out of the last
+runs — the answer to "why did *this* post fail?" without scrolling the log. It stays
+closed until you press it (the button carries how many posts need attention), and
+**Copy** puts the whole thing on your clipboard.
+
+The summary line counts what is left to do (`posts: 36 · sorted and verified: 21 ·
+need attention: 4`), then each post that needs attention gets a block, newest first:
+
+```
+DbdjYF1qPPY · travel · FAILED
+  stage     write-back
+  step      new collection button not found
+  picker    Collections popover - mounted but hidden; the writer revealed it
+  rows seen "memes", "food"
+  controls  div(memes) div(food) button[Save] svg[Remove]
+  tab       was in the background - Chrome throttles hidden tabs
+  error     new_collection_button_not_found (rows: "memes", "food"; …)
+```
+
+Every line is a fact the writer recorded while it worked:
+
+* **step** — which step died, in words (`timed out waiting for the collection name
+  input`, `new collection button not found`, …) rather than only as an error code.
+* **picker / strategy** — how the collection picker was reached (popover revealed,
+  hovered, bookmark click) and which detection rung matched.
+* **rows seen** — the collections the picker actually listed. This is what separates
+  "that collection does not exist yet" from "the picker's rows could not be read".
+* **controls** — every control the writer considered, with `:collapsed` on any it
+  could not measure. That is the fix-list when a create button stops matching.
+* **row match / selection** — for a post that *was* clicked: which row element was
+  clicked, and how the selected state was (or could not be) read.
+* **tab** — whether the post's tab was in the background, because Chrome throttles
+  hidden tabs. A failure with this line says nothing about the page.
+
+Posts that were sorted and verified are not listed; the audit is a to-do list, not a
+dump. A post that was clicked but never confirmed appears as `SORTED BUT
+UNVERIFIED`, and a dry-run-only post appears with its probe verdict, so the three
+outcomes (sorted, unverified, failed) are never blurred together.
+
 ```
 [RESOLVED] 1. save icon — ladder hit: svg[aria-label="Remove"]
     selector   : svg[aria-label="Remove"]
@@ -411,7 +530,11 @@ sortedPosts: [
     status,                             // "collected" | "classified" | "written" | "failed"
     error, failedStage, warning,        // diagnostics when something goes wrong
     writtenConfirmed,                   // did the writer SEE the collection tick?
-    writeTrace,                         // which selector it clicked, and the states it read
+    writeTrace,                         // why it worked or failed, post by post:
+                                        //   failedStep, rowsSeen, panelControls,
+                                        //   panelSample, panelStrategy, panelRevealed,
+                                        //   rowMatched/rowText/rowSelector, selection*,
+                                        //   routeErrors, pageHidden, timerClampMs
     collectedAt, classifiedAt, writtenAt
   }
 ]
@@ -424,8 +547,13 @@ mean it landed. `writtenConfirmed: false` means the writer clicked and could not
 prove the result, and `writeTrace` records which element it clicked
 (`rowSelector`), whether it matched an existing row or created one
 (`rowMatched`), and the selection state before/after. Those posts are counted and
-surfaced separately (the Status card, the run summary, and Diagnose state) rather
-than being folded into the sorted total. They are deliberately **not** retried
+surfaced separately (the Status card, the run summary, the **per-post audit** and
+Diagnose state) rather than being folded into the sorted total.
+
+`writeTrace` is stored for **failures too** (`failedStep`, `rowsSeen`,
+`panelControls`, the picker route and whether the tab was hidden), which is what
+makes the per-post audit possible: a failed post used to keep only its error
+string, so the facts behind it were lost with the tab. They are deliberately **not** retried
 automatically: clicking a collection that did land would toggle the post back out
 of it.
 
@@ -506,6 +634,16 @@ re-check if Instagram changes:
    reverted right after the row click. Older builds instead open a
    `[role="dialog"]` titled *Save to collection* from a bookmark click, and those
    still work through the same ladder.
+
+   **Some builds render that popover as a doorway:** its only entry is *Add
+   collection* (text and `aria-label` both say so, with a `+`/`svg` inside it), and
+   the collections only appear once you click it. The writer treats “no collection
+   rows, one add-collection control” as a doorway and clicks through to the panel it
+   opens; a panel with rows is never treated as one. The same *Add collection* text
+   is therefore **not** a collection name — it is excluded from row labels, which is
+   why the header's **+** can no longer be mistaken for a row (it is the *first*
+   label inside the popover, and anything positional built on the row list — the
+   create control, for one — would otherwise go looking above it).
 4. **Collection rows** are matched by normalised visible text: `study tips` and
    `study_tips` are treated as the same name, exact match preferred over a
    prefix match, and the deepest matching element wins so a wrapper containing
@@ -555,7 +693,10 @@ one real request, then reports:
   links there are, how many parse as a post, how many contain an image, and the
   raw `href` values. This is the part that explains "45 tiles on screen, 0
   recorded" instead of leaving you to guess;
-* the current or last run, the dry-run toggle, and recent errors.
+* the current or last run, the dry-run toggle, and recent errors, including how
+  many of the write-back failures were tagged `[page_hidden]` — those say nothing
+  about the page, they mean the post's tab was in the background (so the fix is the
+  **Post tabs** setting, not a selector).
 
 It ends with a numbered **what to do next** list and a **Copy** button, so you can
 see the state without opening a console. Nothing is changed by diagnosing.
@@ -580,7 +721,9 @@ state** always produces a new one.
 | `*_truncated` | A thinking model spent the whole output budget on reasoning before finishing the JSON. The extension already retries with 4× the budget automatically; if it still happens, choose a non-thinking model or raise `MAX_OUTPUT_TOKENS` in `background.js`. |
 | `classification_not_json: … got: …` | The reply was not usable JSON — the error quotes what the model actually sent, check it in the Test line or the log. Usually it is prose instead of JSON, or output cut off mid-object; try another model. |
 | Warnings `category_recovered_from_partial_json` / `category_inferred_from_text` | The JSON was damaged or never emitted, so the category was salvaged from the model's own text at confidence 0.3 instead of failing the post. Review those posts; they are listed in the log. |
-| Many `timeout_waiting_for_save_icon` failures | Instagram throttled rendering in the hidden tab. Set `WRITE_TABS_ACTIVE = true` in `background.js` (tabs will steal focus while sorting). Confirm with a **dry run** first — its report names the step that fails and what the page exposes. |
+| Errors ending in `[page_hidden]` | The post's tab was in the background while the writer worked. Chrome throttles hidden tabs (a 150 ms timer really takes ~1 s) and Instagram renders less offscreen, so these failures say nothing about the page. The run retries them with the tab in front and logs which step died; to run every post in front from the start, set **Post tabs → Always watch each post**. |
+| Every error ends in `[page_hidden]`, even with the tab in front | The Chrome window is minimised or completely covered by another window — Chrome reports those tabs as hidden and does not render them, so foregrounding cannot help. Keep the window visible (a second monitor is fine) and re-run. |
+| Many `timeout_waiting_for_save_icon` failures *without* a `[page_hidden]` tag | The page really had no bookmark control for 12 s while the tab was visible, so this is a page/DOM problem rather than throttling. Run a **dry run** with **Post tabs → Always watch each post**, which names the step that fails and what the page exposes. |
 | `instagram_login_required` | The background tab was redirected to `/accounts/…`; log in to Instagram in this profile and re-run. |
 | `post_page_timeout` | Slow connection; raise `TAB_LOAD_TIMEOUT_MS` in `background.js`. |
 | Run stops part-way with “Interrupted” | Chrome recycled the idle service worker. Nothing is lost — click the same button again; both phases skip completed work. |
@@ -588,16 +731,19 @@ state** always produces a new one.
 | I scrolled but nothing was collected | Look at the popup's **Collector:** line, or press **Diagnose state**. It distinguishes the five causes: no Instagram tab open; the content script missing from the tab (reload it with F5, and if it persists set the extension's **Site access** to *On all sites* under Details); the tab not being a Saved page; the grid not having rendered any tiles yet; or the tiles existing but their links no longer looking like post addresses. |
 | Diagnosis says *“45 link(s) on the page, but none is a post address”* | Instagram changed the shape of the links in the saved grid, so the collector cannot tell which posts the tiles belong to. The report prints the actual `href` values and the first tile's markup — paste that back and the link pattern in `parsePostHref` (`content-scripts/collector.js`) needs one more case. The collector already accepts any anchor whose href contains `/p/`, `/reel/`, `/reels/` or `/tv/` **anywhere** in the path, so this only triggers when the grid stops putting a post address in the link at all. |
 | Diagnosis says *“N post(s) found but no thumbnail could be read”* | The tiles are readable but their images had not loaded yet. Thumbnails are recorded as soon as an image appears, so keep scrolling; if it stays at 0, the report's *first tile markup* shows what replaced the `<img>`. |
+| `new_collection_button_not_found (rows: …; control(s): …)` | Read `rows:` **first — it separates two opposite problems.** If it lists real collection names (`"memes", "food"`), the picker is real and only the create control is unmatched: create that collection by hand in Instagram (a pre-created row is always found first) and the post sorts next run. If it lists only `"add collection"`, the writer was looking at the **doorway** popover — the list is one click behind it — which the current writer clicks through, so seeing this line means the doorway's click opened nothing (`timed out waiting for the collection panel after add collection` sits above it in the log). Otherwise the create control could not be matched. The parenthesised part lists **what the picker actually contained** — the row labels it could read and the controls it considered (with `:collapsed` on any it could not measure) — so this is a one-paste diagnosis rather than another guess. Usual fixes: create that collection by hand in Instagram (a pre-created row is always found first), or send that line on so the ladder gets one more case. |
 | Sorting stops early: *"every attempt failed at the same step"* | A circuit breaker: several posts in a row failed identically, so the page flow itself is broken and continuing would only churn. The remaining posts stay unsorted and retry on the next run — fix the cause first (the row above, or a dry run). |
 | `save_panel_unreachable (…)` | No route could open the *Save to collection* picker. The error's parenthesised list names **each route that was tried and why it died** — `bookmark hover: timeout_waiting_for_collections_popover_on_hover` means hovering produced no popover, `reveal mounted popover: no mounted Collections popover in the DOM` means there was no popover to reveal, and the plain-language hint after the parenthesised list says whether one exists but could not be made visible. On current builds the picker for an already-saved post is a **CSS-hover popover** (a "Collections" list above the bookmark) that is mounted but hidden; the writer reveals it rather than hovering, and clicks the bookmark only for a post that is not in your library yet. Open a post, hover its bookmark yourself, then press **Inspect the tab I'm on** — the report shows every rung of the panel-detection ladder and the row inventory, and `writeTrace` on each post records which route/strategy won (`panelRevealed`, `openedViaHover`, or a click strategy). |
 | **It said "Sorted" but my collection is still empty** | Check the Status card's *unconfirmed* line and the run summary (`Sorted 20/20 - 4 unverified`). It means the writer clicked but could not read the collection's state back, so it is no longer counted as proven. `writeTrace.selectionSignal` on each post names the signal that was available (or that none was). To retry those, tick **Re-sort posts that were never confirmed** and press the sort button again — posts that WERE confirmed are still skipped, so nothing gets toggled back out. To find out why they failed, run the **dry run**, or open a post, click its bookmark yourself and press **Inspect the tab I'm on**: the report's *category map* says whether a row for each category is found, and `writeTrace.rowSelector` on each post names the element that was clicked. |
-| Warning `collection_state_unverifiable` | The picker's rows expose no `input[type=checkbox]`, no `aria-checked` and no checkmark that differs between rows, so selection cannot be confirmed even though the click was dispatched. The post is marked written but flagged; `writeTrace.selectionSignal` says what was (not) found, and `writeTrace.rowSelector` names the element that was clicked. Open a post, hover its bookmark yourself and press **Inspect the tab I'm on**: the report prints each row plus the selection signal it can read, which is what a build exposing something new will show. |
+| Warning `collection_state_unverifiable` | The picker's rows expose no `input[type=checkbox]`, no `aria-checked` and no checkmark that differs between rows, so selection cannot be confirmed even though the click was dispatched. The post is marked written but flagged; `writeTrace.selectionSignal` says what was (not) found, and `writeTrace.rowSelector` names the element that was clicked. If the signal reads *"the row could not be found again after the click"*, the picker could not be re-opened to verify — on current builds that was the hover-dedupe bug (fixed: the hover is leave-first now), so re-run the sort and expect `aria-selected` / `input.checked` instead; re-running is safe because an already-selected row is skipped, not re-clicked. Open a post, hover its bookmark yourself and press **Inspect the tab I'm on**: the report prints each row plus the selection signal it can read, which is what a build exposing something new will show. |
 | Warning `post_was_unsaved_and_restored` | A bookmark click toggled the post OUT of the saved library during the run and the writer clicked again to put it back (a collection on an unsaved post is meaningless). The write itself succeeded. This should not happen on the current build — the bookmark is only clicked for a post that is *not* in your library. If it appears on every post, run a **dry run** and send the `1b`/`1c` lines. |
 | Warning `collection_created_unconfirmed` | The create-a-collection flow ran but the picker did not list the new row afterwards, so the creation may not have committed. Pre-creating the collections yourself avoids this path entirely (see Step 3). |
 
 Notes on scale: classification is 3 concurrent requests, so ~1000 posts is a long
 but unattended job; write-back is deliberately slow (2–4 s per post) because that
-is what keeps the account safe. A run of 500 posts takes roughly 25–40 minutes
+is what keeps the account safe. A post that has to be retried in the foreground is
+visited twice, which is why the default only switches once per run instead of
+re-opening every failed post in front. A run of 500 posts takes roughly 25–40 minutes
 including the long pauses.
 
 ---

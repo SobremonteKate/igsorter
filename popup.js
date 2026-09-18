@@ -37,6 +37,7 @@ const els = {
   sort: $("sort"),
   dryRun: $("dryRun"),
   resortUnconfirmed: $("resortUnconfirmed"),
+  tabFocus: $("tabFocus"),
   inspect: $("inspect"),
   reportWrap: $("reportWrap"),
   reportMeta: $("reportMeta"),
@@ -48,6 +49,11 @@ const els = {
   diag: $("diag"),
   copyDiag: $("copyDiag"),
   dismissDiag: $("dismissDiag"),
+  auditToggle: $("auditToggle"),
+  auditWrap: $("auditWrap"),
+  auditMeta: $("auditMeta"),
+  auditText: $("auditText"),
+  copyAudit: $("copyAudit"),
   stop: $("stop"),
   clear: $("clear"),
   phase: $("phase"),
@@ -369,10 +375,151 @@ function renderReport(state) {
   els.report.textContent = picked.report.lines.join("\n");
 }
 
+/* ------------------------------------------------------------------------- *
+ * Per-post audit
+ *
+ * A finished run used to be readable only as one line per post in the log, and a
+ * failure threw its trace away entirely. Everything the writer learned is now
+ * stored on the post (writeTrace), so this renders it post by post: which route
+ * opened the picker, which rows were actually there, which controls were usable,
+ * and the step that died - the things that decide WHICH fix is needed.
+ *
+ * The block below the markers is deliberately self-contained and DOM-free, so
+ * tools/_audit-selftest.js can evaluate the real source against stored posts.
+ * ------------------------------------------------------------------------- */
+
+/* --- per-post audit --- */
+
+/** Does this post's outcome deserve a line in the audit? */
+function postNeedsAttention(post) {
+  if (!post) return false;
+  if (post.status === "failed") return true;
+  if (post.status === "written" && post.writtenConfirmed === false) return true;
+  if (post.warning) return true;
+  if (post.dryRunAt && post.status !== "written") return true;
+  return false;
+}
+
+/** "FAILED" / "SORTED BUT UNVERIFIED" / "DRY RUN ONLY" / ... */
+function postVerdict(post) {
+  if (post.status === "failed") return "FAILED";
+  if (post.status === "written" && post.writtenConfirmed === false) {
+    return "SORTED BUT UNVERIFIED";
+  }
+  if (post.status === "written") return "SORTED (warning)";
+  if (post.dryRunAt) return "DRY RUN ONLY - nothing was clicked";
+  return "NOT SORTED";
+}
+
+/** One post's breakdown, as lines a human (or a paste) can read. */
+function postAuditLines(post) {
+  const trace = post.writeTrace || {};
+  const lines = [
+    `${post.shortcode || post.postId || "?"} · ${post.category || "(no category)"} · ${postVerdict(post)}`
+  ];
+  const add = (label, value) => {
+    if (value === null || value === undefined || value === "" || value === "none") return;
+    lines.push(`  ${label.padEnd(9)} ${value}`);
+  };
+
+  const stage = post.failedStage === "classify" ? "classifying" : post.failedStage === "write" ? "write-back" : null;
+  add("stage", stage);
+  add("step", trace.failedStep);
+
+  // How the picker was reached, from the same facts the run log summarises.
+  const route = trace.panelRevealed
+    ? "Collections popover - mounted but hidden; the writer revealed it"
+    : trace.openedViaHover
+      ? "hovering the bookmark"
+      : trace.openedViaMenu
+        ? "the ... menu"
+        : trace.saveIconStrategy
+          ? "bookmark click"
+          : null;
+  add("picker", route);
+  if (trace.openedViaDoorway) {
+    add(
+      "doorway",
+      `the panel only offered "${trace.doorwayText || "add collection"}", so it was clicked to reach the real picker`
+    );
+  }
+  if (trace.doorwayError) {
+    add("doorway", `clicking it opened nothing usable: ${trace.doorwayError}`);
+  }
+  add("strategy", trace.panelStrategy);
+  if (Array.isArray(trace.rowsSeen)) {
+    add("rows seen", trace.rowsSeen.length ? trace.rowsSeen.map((row) => `"${row}"`).join(", ") : "none readable");
+  }
+  if (Array.isArray(trace.panelControls) && trace.panelControls.length) {
+    add("controls", trace.panelControls.join(" "));
+  }
+  if (trace.rowText) {
+    add("row match", `"${trace.rowText}" (${trace.rowMatchType || "matched"}) -> ${trace.rowSelector || "?"}`);
+  }
+  if (trace.rowMatched === "created") add("row match", "no row existed; created it");
+  if (trace.selectionSignal) {
+    const state = trace.selectionAfter === null ? "unreadable" : String(trace.selectionAfter);
+    add("selection", `${state} (read via ${trace.selectionSignal})`);
+  }
+  if (Array.isArray(trace.routeErrors) && trace.routeErrors.length) {
+    add("routes", trace.routeErrors.join(" | "));
+  }
+  if (trace.pageHidden) add("tab", "was in the background - Chrome throttles hidden tabs, so this failure may say nothing about the page");
+  add("warning", post.warning);
+  add("error", post.error);
+  if (post.dryRunSummary) add("probe", post.dryRunSummary);
+  return lines;
+}
+
+/** The whole audit: a summary line, then every post that needs attention. */
+function auditLines(posts) {
+  const list = Array.isArray(posts) ? posts : [];
+  const needs = list.filter(postNeedsAttention);
+  const confirmed = list.filter(
+    (post) => post.status === "written" && post.writtenConfirmed !== false
+  ).length;
+  const lines = [
+    `posts: ${list.length} · sorted and verified: ${confirmed} · need attention: ${needs.length}`
+  ];
+  if (!needs.length) {
+    lines.push("nothing needs attention: every classified post is in its collection and was verified");
+    return lines;
+  }
+  // Most recent first, so the last run is at the top of the list.
+  const ordered = needs.slice().sort((a, b) => (b.writtenAt || b.dryRunAt || 0) - (a.writtenAt || a.dryRunAt || 0));
+  for (const post of ordered.slice(0, 25)) {
+    lines.push("");
+    lines.push(...postAuditLines(post));
+  }
+  if (ordered.length > 25) lines.push(`\n... and ${ordered.length - 25} more post(s) needing attention`);
+  return lines;
+}
+
+/* --- end per-post audit --- */
+
+let auditOpen = false;
+
+/** Render the audit panel and its toggle. */
+function renderAudit(state) {
+  const posts = state.posts || [];
+  const needs = posts.filter(postNeedsAttention).length;
+  els.auditToggle.textContent = needs
+    ? `Per-post audit (${needs})`
+    : "Per-post audit (nothing to flag)";
+  const lines = auditLines(posts);
+  els.auditText.textContent = lines.join("\n");
+  els.auditMeta.textContent = needs
+    ? `${needs} post(s) need attention · most recent first`
+    : "every classified post is in its collection and was verified";
+  els.auditWrap.style.display = auditOpen ? "" : "none";
+  els.auditToggle.classList.toggle("primary", auditOpen);
+}
+
 function render(state) {
   const { posts, settings, job, username } = state;
 
   renderProvider(settings);
+  renderAudit(state);
   if (document.activeElement !== els.categories) {
     els.categories.value = (settings.categories || DEFAULT_CATEGORIES).join(", ");
   }
@@ -380,6 +527,8 @@ function render(state) {
   if (document.activeElement !== els.dryRun) els.dryRun.checked = dryRun;
   const resort = !!settings.resortUnconfirmed;
   if (document.activeElement !== els.resortUnconfirmed) els.resortUnconfirmed.checked = resort;
+  const tabFocus = settings.tabFocus || "on-failure";
+  if (document.activeElement !== els.tabFocus) els.tabFocus.value = tabFocus;
   els.sort.textContent = dryRun
     ? "3 · Dry-Run Sort (no clicks)"
     : "3 · Sort Into Collections";
@@ -647,7 +796,7 @@ els.sort.addEventListener("click", async () => {
     { type: "START_WRITEBACK", dryRun },
     dryRun
       ? "Dry run started — each post is inspected, nothing is clicked."
-      : "Sorting started — background tabs will open and close automatically."
+      : "Sorting started — each post opens in its own tab and is closed again. Tab visibility follows the \"Post tabs\" setting."
   );
   if (response.ok) setTimeout(scheduleRefresh, 300);
 });
@@ -664,6 +813,13 @@ els.resortUnconfirmed.addEventListener("change", async () => {
   await act({
     type: "SET_SETTINGS",
     patch: { resortUnconfirmed: els.resortUnconfirmed.checked }
+  });
+});
+
+els.tabFocus.addEventListener("change", async () => {
+  await act({
+    type: "SET_SETTINGS",
+    patch: { tabFocus: els.tabFocus.value }
   });
 });
 
@@ -744,6 +900,24 @@ els.copyReport.addEventListener("click", () =>
 );
 
 els.copyDiag.addEventListener("click", () => copyText(els.diag.textContent, els.diag));
+
+els.copyAudit.addEventListener("click", () => copyText(els.auditText.textContent, els.auditText));
+
+/**
+ * The audit stays closed until asked for: it is a post-by-post read-out, and a
+ * wall of text appearing on its own after every run is exactly the noise the
+ * diagnosis panel already had to learn to avoid. The toggle carries the count, so
+ * "is there anything to look at?" is answerable without opening it.
+ */
+els.auditToggle.addEventListener("click", () => {
+  auditOpen = !auditOpen;
+  els.auditWrap.style.display = auditOpen ? "" : "none";
+  els.auditToggle.classList.toggle("primary", auditOpen);
+  feedback(
+    auditOpen ? "Showing the per-post audit — Copy puts it on your clipboard." : "Audit hidden.",
+    auditOpen ? "ok" : "warn"
+  );
+});
 
 /**
  * Hide the report until the next one runs. Only the panel is hidden: the stored

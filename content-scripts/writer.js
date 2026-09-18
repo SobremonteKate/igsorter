@@ -54,6 +54,12 @@
     moreStrategy: null,
     openedViaMenu: false,
     openedViaHover: false,
+    // Set when the popover turned out to be a DOORWAY (its only entry is "Add
+    // collection") and the real picker opened after clicking it. See
+    // escalateThroughDoorway().
+    openedViaDoorway: false,
+    doorwayText: null,
+    doorwayError: null,
     // Set when the picker was found ALREADY MOUNTED in the DOM and merely made
     // visible by us (the CSS-`:hover` builds, where no dispatched event can ever
     // reveal it). Reported so the log says which route actually won.
@@ -61,7 +67,14 @@
     // Set when findSavePanel() matches a container that carries the expected
     // texts but shows zero checkbox rows - the tell of a reel-page overlay that
     // merely talks about saving. Used to warn + gate the write below.
-    panelSuspicious: false
+    panelSuspicious: false,
+    // Was this tab in the background while we worked? Chrome throttles timers
+    // there and Instagram does not render some UI offscreen, so a failure with
+    // this set says nothing about the post - background.js retries those with
+    // the tab brought to the front.
+    pageHidden: false,
+    // Measured timer clamp (see measureTimerClamp): ~0 visible, ~1000 hidden.
+    timerClampMs: null
   };
 
   /* ---------------------------------------------------------------------- *
@@ -69,6 +82,99 @@
    * ---------------------------------------------------------------------- */
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /* ---------------------------------------------------------------------- *
+   * Waiting that survives a background tab
+   *
+   * Chrome clamps timers in tabs the user is not looking at: a `setTimeout(150)`
+   * in a background tab really fires after ~1000ms, and once a tab has been
+   * hidden for five minutes its chained timers are batched to roughly one per
+   * minute. Every wait in this file used to be a sleep() poll, so a hidden tab
+   * silently got ~5x fewer attempts than a visible one and any multi-step
+   * sequence (click, then re-read the row) timed out even though the DOM was
+   * fine. Watching the tab made it work - exactly the difference reported.
+   *
+   * Two changes, both measured rather than assumed:
+   *   1. measureTimerClamp() times a zero-delay timer and spends wait budgets in
+   *      ATTEMPTS rather than wall-clock milliseconds, so a throttled tab gets
+   *      the same number of looks as a visible one (with an overall cap so one
+   *      broken post cannot stall the batch).
+   *   2. waitFor() is woken by DOM mutations as well as by the timer. Mutation
+   *      callbacks are microtask-scheduled, so they are NOT throttled, and a
+   *      background tab resolves the moment the node it wants appears.
+   * ---------------------------------------------------------------------- */
+
+  let timerClampMs = null;
+  let clampProbe = null;
+
+  /** ms a zero-delay timer really takes here (~0 visible, ~1000 throttled). */
+  function measureTimerClamp() {
+    if (clampProbe) return clampProbe;
+    clampProbe = (async () => {
+      let worst = 0;
+      for (let i = 0; i < 3; i++) {
+        const start = Date.now();
+        await sleep(0);
+        worst = Math.max(worst, Date.now() - start);
+      }
+      timerClampMs = worst;
+      return worst;
+    })();
+    return clampProbe;
+  }
+
+  /** True when this tab is in the background (Chrome throttles it). */
+  function isPageHidden() {
+    try {
+      return document.visibilityState === "hidden";
+    } catch {
+      return false;
+    }
+  }
+
+  const waiters = new Set();
+  let sharedObserver = null;
+  let lastWakeAt = 0;
+  // Re-checking on every mutation batch would be wasteful on a page that mutates
+  // constantly (Instagram animates carousels and stories); this keeps it under
+  // ~8 wake-ups per second and still lands far sooner than the clamp above.
+  const WAKE_COOLDOWN_MS = 120;
+
+  function notifyWaiters() {
+    if (!waiters.size) return;
+    const now = Date.now();
+    if (now - lastWakeAt < WAKE_COOLDOWN_MS) return;
+    lastWakeAt = now;
+    for (const wake of [...waiters]) wake();
+  }
+
+  function observeDom() {
+    if (sharedObserver || typeof MutationObserver !== "function") return;
+    const root = document.documentElement || document.body;
+    if (!root) return;
+    sharedObserver = new MutationObserver(notifyWaiters);
+    // `class` is deliberately included: on these builds the selection state is a
+    // class or inline-style flip, which is precisely the change we wait for.
+    sharedObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+  }
+
+  /** Wait for either a timer tick or any DOM mutation, whichever comes first. */
+  async function waitForWakeup(tick) {
+    let wake;
+    const woken = new Promise((resolve) => {
+      wake = resolve;
+    });
+    waiters.add(wake);
+    try {
+      await Promise.race([sleep(tick), woken]);
+    } finally {
+      waiters.delete(wake);
+    }
+  }
 
   function isVisible(element) {
     if (!element || !element.isConnected) return false;
@@ -82,15 +188,63 @@
     );
   }
 
-  /** Generic polling wait. Throws a descriptive timeout error. */
+  /**
+   * Is this element usable for a click?
+   *
+   * `relaxed` widens the answer to "connected, and inside a popover we have
+   * force-revealed". It is needed because of how this popover is built: the
+   * container can be a normal 260x240 while every row and the header's create
+   * control still measure 0x0 (collapsed inner wrappers). A dispatched click
+   * does not need geometry at all - React listens at the root, not at the
+   * coordinates - so refusing to use those nodes is exactly what made the writer
+   * report "no rows" and "no create button" on a picker that was right there.
+   *
+   * Outside a revealed popover the strict check is kept, so an ambient hidden
+   * overlay can never be adopted as the picker.
+   */
+  function isUsable(element, relaxed = false) {
+    if (!element || !element.isConnected) return false;
+    if (isVisible(element)) return true;
+    if (!relaxed) return false;
+    return insideRevealed(element);
+  }
+
+  /** Is this node inside something forceReveal() made usable? */
+  function insideRevealed(element) {
+    for (let node = element; node; node = node.parentElement) {
+      if (revealedRoots.has(node)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Generic polling wait. Throws a descriptive timeout error.
+   *
+   * The budget is spent in attempts (see measureTimerClamp), so a hidden tab is
+   * not silently starved of looks just because its timers are throttled.
+   */
   async function waitFor(getValue, options = {}) {
     const { timeout = 10000, interval = 200, label = "element" } = options;
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
+    // Seed the tick from visibility so the FIRST look happens immediately:
+    // awaiting the measurement would itself cost ~3 throttled seconds in a
+    // background tab. The measured value takes over as soon as it lands.
+    measureTimerClamp();
+    const clamp =
+      timerClampMs != null ? timerClampMs : isPageHidden() ? 1200 : 0;
+    const tick = Math.max(interval, clamp + 20);
+    const attempts = Math.max(6, Math.ceil(timeout / Math.max(interval, 1)));
+    const budget = Math.min(attempts * tick, timeout * 2 + 2000);
+    observeDom();
+    const deadline = Date.now() + budget;
+    for (;;) {
       const value = getValue();
       if (value) return value;
-      await sleep(interval);
+      if (Date.now() >= deadline) break;
+      await waitForWakeup(tick);
     }
+    // One last look: a mutation can land in the same tick we gave up on.
+    const finalValue = getValue();
+    if (finalValue) return finalValue;
     throw new Error(`timeout_waiting_for_${label}`);
   }
 
@@ -210,6 +364,54 @@
   }
 
   /**
+   * Open the hover popover, in two phases.
+   *
+   * Phase 1 is the plain enter sequence - it is what worked on the live build
+   * (a run where 8 posts in a row opened via "hovering the bookmark").
+   * Dispatching a leave FIRST, before anything else has happened on the page,
+   * was tried and measured WORSE: on the real site it dismisses/clears the
+   * popover state instead of refreshing it, and the picker never opens at all
+   * (a later run: hover matched on 0 of 12 posts, "sometimes it just closes
+   * the tab and never clicks"). So no leave is dispatched up front.
+   *
+   * Phase 2 covers the other measured failure: after a click (whose events
+   * bubble through the wrapper and leave React's inside-state set), the NEXT
+   * enter can be deduped to a no-op - the popover never re-opens and post-click
+   * verification reads "the row could not be found again". So when the plain
+   * hover produced nothing, the leave sequence runs once and the hover is
+   * retried. A real pointer arriving from elsewhere produces exactly this
+   * out-then-enter pattern, so phase 2 is honest input, just in the order a
+   * pointer would need it.
+   *
+   * Both phases are driven through `attempt` so the caller decides what counts
+   * as success (usually: the picker became findable).
+   */
+  async function hoverWithRetry(element, attempt, { phaseDelay = 350 } = {}) {
+    if (!element) return null;
+    hoverElement(element);
+    let firstError = null;
+    try {
+      const first = await attempt();
+      if (first) return first;
+    } catch (error) {
+      // A timeout in phase 1 must not skip phase 2 - remember it and carry on.
+      firstError = error;
+    }
+    // Phase 2: clear React's inside-state, then enter again.
+    unhoverElement(element);
+    if (phaseDelay) await sleep(phaseDelay);
+    hoverElement(element);
+    try {
+      return await attempt();
+    } catch (error) {
+      // Both phases failed: rethrow the FIRST error so route errors keep the
+      // specific waitFor label ("timeout_waiting_for_collections_popover_on_hover")
+      // instead of a generic one.
+      throw firstError || error;
+    }
+  }
+
+  /**
    * The opposite of hoverElement(): what a real pointer leaving the icon sends.
    * React keeps its hover state until a leave event arrives, so this is what
    * dismisses a popover we opened ourselves (Escape does not close it).
@@ -283,6 +485,17 @@
 
   let revealUndo = [];
   let revealTouched = new WeakMap();
+  // The node we revealed last. The picker is polled several times a second while
+  // we wait for it, and forceReveal() used to undo and re-apply every property on
+  // every one of those passes - churn the page can see. Now the reveal is only
+  // torn down when we move to a different node (or close the panel).
+  let revealTarget = null;
+  // Popovers we have force-revealed. Inside one of those a zero-sized node is
+  // still a usable control - see isUsable().
+  let revealedRoots = new WeakSet();
+  // Cap for the subtree pass: a picker holds a handful of rows, so this only
+  // exists so a pathological page cannot stall the run.
+  const REVEAL_SUBTREE_MAX = 600;
 
   function styleHides(element) {
     const style = getComputedStyle(element);
@@ -327,10 +540,28 @@
     }
   }
 
-  /** Make a mounted-but-hidden element visible. True when it worked. */
-  function forceReveal(element) {
-    undoReveal();
+  /**
+   * Make a mounted-but-hidden element usable. `isReady` decides what "usable"
+   * has to mean here - for the picker it is "its rows and its header control can
+   * be used", not merely "the container measures more than 0x0".
+   *
+   * Three passes, each strictly wider than the last, because "hidden" is not one
+   * state: (1) the ancestors hide it (display / visibility / opacity - nearly
+   * every popover), (2) it is collapsed rather than hidden (max-height / height /
+   * transform / clip-path), and (3) the container HAS a size while its CONTENTS
+   * are collapsed, which is how Instagram keeps this popover mounted - the chain
+   * above the container cannot fix that, so the subtree is fixed too. Pass 3 is
+   * the one that matters: without it we accepted a "picker" whose every row and
+   * whose create control still measured 0x0, which is exactly the state that
+   * produced new_collection_button_not_found after the row lookup missed.
+   */
+  function forceReveal(element, { isReady } = {}) {
     if (!element) return false;
+    if (revealTarget !== element) undoReveal();
+    revealTarget = element;
+    const ready = isReady || (() => isVisible(element));
+    if (ready()) return markRevealed(element);
+
     const chain = [];
     for (
       let node = element;
@@ -342,16 +573,28 @@
     for (const node of chain) {
       if (styleHides(node)) applyRevealStyles(node, REVEAL_BASIC);
     }
-    if (isVisible(element)) return true;
-    // Still invisible, so it is collapsed rather than display:none'd. Escalate
-    // to the full property set along the whole chain, then measure again.
+    if (ready()) return markRevealed(element);
+
     for (const node of chain) {
       applyRevealStyles(node, Object.keys(REVEAL_VALUES));
     }
-    if (isVisible(element)) return true;
-    // Could not make it visible - leave the page exactly as it was.
+    if (ready()) return markRevealed(element);
+
+    const subtree = [...element.querySelectorAll("*")];
+    for (const node of subtree.slice(0, REVEAL_SUBTREE_MAX)) {
+      if (styleHides(node)) applyRevealStyles(node, Object.keys(REVEAL_VALUES));
+    }
+    if (ready()) return markRevealed(element);
+
+    // Could not make it usable - leave the page exactly as it was.
     undoReveal();
     return false;
+  }
+
+  /** Remember that everything under this node is ours to click while revealed. */
+  function markRevealed(element) {
+    revealedRoots.add(element);
+    return true;
   }
 
   function undoReveal() {
@@ -366,6 +609,8 @@
     }
     revealUndo = [];
     revealTouched = new WeakMap();
+    revealTarget = null;
+    revealedRoots = new WeakSet();
   }
 
   /**
@@ -378,8 +623,30 @@
     if (already) return already;
     const hidden = findCollectionsPopover({ includeHidden: true });
     if (!hidden) return null;
-    if (!forceReveal(hidden)) return null;
-    const visible = findCollectionsPopover() || (isVisible(hidden) ? hidden : null);
+    /*
+     * Readiness is measured STRICTLY, on the real computed styles: "the container
+     * is visible" is not enough, because every step after this one (row matching,
+     * the create control, the selection read) looks INSIDE the popover. When
+     * nothing inside can be measured, forceReveal escalates - and finally fixes
+     * the collapsed subtree - instead of handing back a picker with an empty
+     * inside, which is what made the writer report no rows and no create button.
+     *
+     * Just as importantly it is not enough that SOME descendant has text. The
+     * popover's title is always visible - Instagram keeps the header mounted and
+     * collapses the rows behind a :hover rule - so "any text inside" was satisfied
+     * by the word "Collections" alone, the reveal reported success, and the writer
+     * walked into a picker whose rows were still 0x0. What has to be usable is a
+     * collection row to match, or the control that creates the missing one (the
+     * doorway build has no rows at all, only that control).
+     */
+    const ready = () => {
+      if (!isVisible(hidden)) return false;
+      if (rowLabelsIn(hidden).length) return true;
+      const control = findCreateControl(hidden);
+      return !!control && isUsable(control, true);
+    };
+    if (!forceReveal(hidden, { isReady: ready })) return null;
+    const visible = findCollectionsPopover() || (isUsable(hidden, true) ? hidden : null);
     if (visible) {
       // Recorded here so every caller (the write path, the dry run) reports the
       // same fact about how the picker was reached.
@@ -429,6 +696,8 @@
        * measures 0x0, so every hidden candidate would otherwise tie.
        */
       const depth = depthWithin(node, document.body);
+      // Not actually inside the body (e.g. <html> itself): never a picker.
+      if (depth < 0) continue;
       const area = rect.width * rect.height;
       if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
         bestDepth = depth;
@@ -473,13 +742,19 @@
    * the dialog picker (checkbox + label) and for the hover popover (thumbnail +
    * label) alike, because it never assumes a checkbox exists.
    */
-  function panelRows(panel) {
+  function panelRows(panel, { relaxed = false } = {}) {
     const seen = new Set();
     const rows = [];
     for (const element of panel.querySelectorAll("*")) {
-      if (!isVisible(element)) continue;
+      if (!isUsable(element, relaxed)) continue;
       const text = normalizeName(element.textContent);
       if (!text || text.length > 40) continue;
+      // The popover's own header ("Collections") is not a collection. rowLabelsIn
+      // has always excluded it; panelRows must too, because the title is the
+      // FIRST such carrier inside the popover and anything positional built on
+      // panelRows() - the header's create control, for one - would otherwise
+      // treat the title as the first row and then look for the "+" above it.
+      if (text === "collections") continue;
       if ([...element.children].some((child) => normalizeName(child.textContent) !== "")) {
         continue;
       }
@@ -498,12 +773,12 @@
     return rows;
   }
 
-  /** The deepest visible element inside `root` whose text is exactly `wanted`. */
-  function deepestTextCarrier(root, wanted) {
+  /** The deepest element inside `root` whose text is exactly `wanted`. */
+  function deepestTextCarrier(root, wanted, relaxed = false) {
     let best = null;
     let bestDepth = -1;
     for (const element of root.querySelectorAll("*")) {
-      if (!isVisible(element)) continue;
+      if (!isUsable(element, relaxed)) continue;
       if (normalizeName(element.textContent) !== wanted) continue;
       const depth = depthWithin(element, root);
       if (depth > bestDepth) {
@@ -523,10 +798,10 @@
    * choice. We never dispatch twice - two clicks would toggle twice and land
    * the post exactly where it started, with nothing to show for it.
    */
-  function rowClickTarget(row, label) {
+  function rowClickTarget(row, label, relaxed = false) {
     const clickables = [
       ...row.querySelectorAll('[role="button"], button, a, label, [tabindex]')
-    ].filter(isVisible);
+    ].filter((element) => isUsable(element, relaxed));
     const containing = clickables.filter((element) => element.contains(label));
     const pool = containing.length ? containing : clickables;
     let best = null;
@@ -547,6 +822,17 @@
       .replace(/[\s\u00a0_\-]+/g, " ")
       .trim();
 
+  /**
+   * Hops from `element` up to `root`, or -1 when `root` is not an ancestor.
+   *
+   * The -1 matters. Without it, a node OUTSIDE the subtree keeps counting upward
+   * past the root and can land on exactly the same depth as a real candidate:
+   * with `<body>` as the root, `<html>` walks to 1 and then 2, tying with the
+   * popover - and the area tiebreak then prefers it (it is the smaller box in a
+   * mock, and on a page it depends on the viewport). That is how a container the
+   * writer must never click inside could be adopted as the picker; the per-post
+   * audit is what surfaced it, by naming a bookmark control as part of the picker.
+   */
   function depthWithin(element, root) {
     let depth = 0;
     let node = element;
@@ -554,17 +840,24 @@
       depth++;
       node = node.parentElement;
     }
-    return depth;
+    return node === root ? depth : -1;
   }
 
-  /** Find the most specific visible button whose visible text matches. */
-  function findButtonByText(root, labels) {
+  /**
+   * Find the most specific button whose (own or nested) text matches.
+   *
+   * `relaxed` defaults to "strict, unless this root is a popover we revealed" -
+   * callers do not have to know which world they are in, and a page outside the
+   * revealed popover is still held to the strict rule.
+   */
+  function findButtonByText(root, labels, { relaxed = null } = {}) {
+    const useRelaxed = relaxed == null ? insideRevealed(root) : relaxed;
     const wanted = labels.map((label) => normalizeName(label));
     const candidates = root.querySelectorAll('button, [role="button"], a');
     let best = null;
     let bestLength = Infinity;
     for (const candidate of candidates) {
-      if (!isVisible(candidate)) continue;
+      if (!isUsable(candidate, useRelaxed)) continue;
       const text = normalizeName(candidate.textContent);
       if (!text || !wanted.includes(text)) continue;
       // The shortest matching text is the most specific (outer wrappers
@@ -847,6 +1140,38 @@
    * was not recognised") instead of one generic timeout that could mean
    * anything.
    */
+  /**
+   * Click through a doorway popover and hand back the panel it opened.
+   *
+   * Returns null when there was no doorway, or when clicking it opened nothing
+   * that looks like the picker - the caller then keeps the panel it had, and the
+   * audit records why the doorway did not work (`doorwayError`).
+   */
+  async function escalateThroughDoorway(panel) {
+    const button = doorwayIn(panel);
+    if (!button) return null;
+    trace.doorwayText =
+      normalizeName(button.textContent) ||
+      normalizeName((button.getAttribute && button.getAttribute("aria-label")) || "");
+    clickElement(button);
+    try {
+      return await waitFor(
+        () => {
+          const candidate = findSavePanel({ allowReveal: true });
+          if (!candidate) return null;
+          const rows = panelRows(candidate, { relaxed: insideRevealed(candidate) });
+          // The real picker is the one showing collections that are not the
+          // doorway control itself.
+          return rows.some((row) => !button.contains(row)) ? candidate : null;
+        },
+        { timeout: 4000, interval: 200, label: "collection_panel_after_add_collection" }
+      );
+    } catch (error) {
+      trace.doorwayError = String((error && error.message) || error);
+      return null;
+    }
+  }
+
   async function openSavePanel(icon) {
     trace.routeErrors = [];
     // Some routes click the bookmark, which TOGGLES the saved state on builds
@@ -882,8 +1207,21 @@
      * overwrite the strategy, and the log would name whatever the last lookup
      * happened to match instead of the route that actually worked.
      */
-    const opened = (panel) => {
-      if (panel) trace.panelOpenStrategy = trace.panelStrategy;
+    const opened = async (panel) => {
+      if (!panel) return panel;
+      trace.panelOpenStrategy = trace.panelStrategy;
+      /*
+       * One step deeper when what we found was only a doorway (see
+       * escalateThroughDoorway). The route above still counts as the route that
+       * reached the picker, so the strategy is re-read afterwards and the doorway
+       * is recorded on its own.
+       */
+      const deeper = await escalateThroughDoorway(panel);
+      if (deeper) {
+        panel = deeper;
+        trace.openedViaDoorway = true;
+        trace.panelOpenStrategy = trace.panelStrategy;
+      }
       return panel;
     };
 
@@ -903,7 +1241,7 @@
       if (!popover) throw new Error("no mounted Collections popover in the DOM");
       return popover;
     });
-    if (revealed) return opened(revealed);
+    if (revealed) return await opened(revealed);
 
     /*
      * Route 2 - the manual flow (hover the bookmark, wait for the list), kept
@@ -913,19 +1251,22 @@
      */
     if (wasSaved) {
       const target = findSaveIcon() || icon;
-      hoverElement(target);
-      // No pointerout is dispatched afterwards, so React keeps the hover state
-      // while we poll for the popover.
+      // Two-phase: plain hover first (the live build's route), and only if the
+      // popover still is not findable, a leave-then-hover retry for builds
+      // where a prior click's events would dedupe the second enter.
       const viaHover = await attempt("bookmark hover", () =>
-        waitFor(findPanelNow, {
-          timeout: 2500,
-          interval: 200,
-          label: "collections_popover_on_hover"
-        })
+        hoverWithRetry(target, () =>
+          waitFor(findPanelNow, {
+            timeout: 1500,
+            interval: 200,
+            label: "collections_popover_on_hover"
+          }),
+          { phaseDelay: 250 }
+        )
       );
       if (viaHover) {
         trace.openedViaHover = true;
-        return opened(viaHover);
+        return await opened(viaHover);
       }
     }
 
@@ -948,21 +1289,26 @@
           });
         }
       );
-      if (direct) return opened(direct);
+      if (direct) return await opened(direct);
 
       // That click saved the post, and the collections live in the popover, so
-      // try it once more now that the post has a saved state.
-      hoverElement(findSaveIcon() || icon);
+      // try it once more now that the post has a saved state. Two-phase, as
+      // above: the click's own events can dedupe the first enter.
       const afterSave = await attempt("popover after saving the post", () =>
-        waitFor(findPanelNow, {
-          timeout: 2500,
-          interval: 200,
-          label: "collections_popover_after_save"
-        })
+        hoverWithRetry(
+          findSaveIcon() || icon,
+          () =>
+            waitFor(findPanelNow, {
+              timeout: 1500,
+              interval: 200,
+              label: "collections_popover_after_save"
+            }),
+          { phaseDelay: 250 }
+        )
       );
       if (afterSave) {
         trace.openedViaHover = true;
-        return opened(afterSave);
+        return await opened(afterSave);
       }
     }
 
@@ -1028,10 +1374,20 @@
   function findCollectionRow(panel, category) {
     const wanted = normalizeName(category);
     if (!wanted) return null;
+    // Rows inside a popover we force-revealed stay usable even when Instagram
+    // keeps their wrappers collapsed - see isUsable.
+    const relaxed = insideRevealed(panel);
+    const rows = panelRows(panel, { relaxed });
+    // What the picker offered, recorded for the per-post audit in the popup:
+    // "this category has no collection yet" and "the rows could not be read at
+    // all" look identical in an error message but need opposite fixes.
+    trace.rowsSeen = rows
+      .map((row) => normalizeName(row.textContent).slice(0, 24))
+      .slice(0, 12);
 
     let exact = null;
     let loose = null;
-    for (const row of panelRows(panel)) {
+    for (const row of rows) {
       const text = normalizeName(row.textContent);
       if (text === wanted) {
         exact = row;
@@ -1044,9 +1400,11 @@
 
     const row = exact || loose;
     if (!row) return null;
+    trace.rowText = normalizeName(row.textContent).slice(0, 24);
+    trace.rowMatchType = exact ? "exact" : "prefix";
 
-    const label = deepestTextCarrier(row, wanted) || row;
-    const toggle = rowClickTarget(row, label);
+    const label = deepestTextCarrier(row, wanted, relaxed) || row;
+    const toggle = rowClickTarget(row, label, relaxed);
     return {
       row,
       label,
@@ -1064,12 +1422,12 @@
    */
   const SELECTION_MARK_RE = /check|selected|added|included|tick/i;
 
-  function selectionMarkIn(row) {
+  function selectionMarkIn(row, relaxed = false) {
     const candidates = row.querySelectorAll(
       'svg, [role="img"], [role="checkbox"], [aria-label], [data-testid]'
     );
     for (const element of candidates) {
-      if (!isVisible(element)) continue;
+      if (!isUsable(element, relaxed)) continue;
       const haystack = [
         element.getAttribute("aria-label") || "",
         element.getAttribute("data-testid") || "",
@@ -1081,10 +1439,10 @@
     return null;
   }
 
-  function marksAreMeaningful(panel) {
-    const rows = panelRows(panel);
+  function marksAreMeaningful(panel, relaxed = false) {
+    const rows = panelRows(panel, { relaxed });
     if (rows.length < 2) return false;
-    const marked = rows.filter((row) => !!selectionMarkIn(row)).length;
+    const marked = rows.filter((row) => !!selectionMarkIn(row, relaxed)).length;
     return marked > 0 && marked < rows.length;
   }
 
@@ -1096,6 +1454,7 @@
    * way in that case, which is exactly why it is surfaced instead of guessed.
    */
   function readRowSelection(row, panel) {
+    const relaxed = insideRevealed(panel);
     const checkbox = row.querySelector('input[type="checkbox"]');
     if (checkbox) return { state: !!checkbox.checked, signal: "input.checked" };
 
@@ -1106,8 +1465,8 @@
       if (value === "false") return { state: false, signal: attr };
     }
 
-    const marked = marksAreMeaningful(panel);
-    if (selectionMarkIn(row)) {
+    const marked = marksAreMeaningful(panel, relaxed);
+    if (selectionMarkIn(row, relaxed)) {
       return marked
         ? { state: true, signal: "selection mark present (rows disagree)" }
         : { state: null, signal: "a selection mark on every row reads as decoration" };
@@ -1122,15 +1481,16 @@
    * Step (d) - create the collection when it does not exist
    * ---------------------------------------------------------------------- */
 
-  /** Find the most specific visible control whose aria-label matches. */
-  function findButtonByLabel(root, patterns) {
+  /** Find the most specific control whose aria-label matches (see isUsable). */
+  function findButtonByLabel(root, patterns, { relaxed = null } = {}) {
+    const useRelaxed = relaxed == null ? insideRevealed(root) : relaxed;
     const candidates = root.querySelectorAll(
       '[aria-label], [role="button"], button, a'
     );
     let best = null;
     let bestLength = Infinity;
     for (const candidate of candidates) {
-      if (!isVisible(candidate)) continue;
+      if (!isUsable(candidate, useRelaxed)) continue;
       const label = candidate.getAttribute && candidate.getAttribute("aria-label");
       if (!label || !patterns.some((pattern) => pattern.test(label))) continue;
       if (label.length < bestLength) {
@@ -1170,8 +1530,11 @@
   } = {}) {
     const roots = scope ? [scope, document] : [document];
     for (const root of roots) {
+      // Usable, not strictly visible: in a revealed popover the freshly opened
+      // create form can still be collapsed, and the `exclude` set below is what
+      // keeps a pre-existing page input (the reels comment box) out anyway.
       const inputs = [...root.querySelectorAll('input[type="text"], input:not([type])')]
-        .filter(isVisible)
+        .filter((element) => isUsable(element, true))
         .filter((element) => !element.readOnly && !element.disabled);
       if (!inputs.length) continue;
 
@@ -1196,34 +1559,229 @@
     return null;
   }
 
-  async function createCollection(panel, category) {
-    // The hover popover renders the create affordance as a bare "+" button in
-    // the header rather than a "New collection" button.
-    const newButton =
-      findButtonByText(panel, [
-        "new collection",
-        "create new collection",
-        "new",
-        "+",
-        "add"
-      ]) || findButtonByLabel(panel, [/new collection/i, /^\+$/, /^create/i, /^add$/i]);
-    if (!newButton) throw new Error("new_collection_button_not_found");
+  /*
+   * The create affordance, searched the way the markup varies.
+   *
+   * Builds differ on this one control more than on anything else: a dialog has a
+   * "New collection" button, the hover popover has a bare "+" in its header, and
+   * on the build that kept failing the header control is not inside the node we
+   * adopt as the panel at all (it sits in a sibling header of the popover
+   * wrapper). So the ladder widens by SCOPE as well as by wording - and every
+   * candidate must be a plausible create control, so a post's own action
+   * buttons (Save / Like / Share / ⋯) can never be clicked by mistake.
+   */
+  const CREATE_TEXT_RE = /^(new collection|create new collection|create collection|new|add|add new|\+)$/;
+  const CREATE_LABEL_RE = /new collection|create.*collection|^\+$|^create$|^new$|^add$/i;
+  const NOT_CREATE_RE =
+    /save|remove|unsave|like|comment|share|report|more options|unfollow|block|message|tag|copy link|embed/i;
 
-    // Snapshot what already exists: after this click, a NEW text input is the
-    // create form. Anything pre-existing is page furniture and stays excluded.
+  /** Does this node still look like the Collections popover itself? */
+  function isPopoverLike(node) {
+    return /^collections/.test(normalizeName((node && node.textContent) || ""));
+  }
+
+  function findCreateControl(panel) {
+    const relaxed = insideRevealed(panel);
+    const scopes = [panel];
+    for (
+      let node = panel.parentElement, hops = 0;
+      node && hops < 2;
+      node = node.parentElement, hops++
+    ) {
+      if (isPopoverLike(node)) scopes.push(node);
+    }
+    for (const scope of scopes) {
+      const inScope = relaxed || insideRevealed(scope);
+      let best = null;
+      let bestDepth = -1;
+      for (const candidate of scope.querySelectorAll(
+        'button, [role="button"], [aria-label], a, [tabindex]'
+      )) {
+        if (!isUsable(candidate, inScope)) continue;
+        const text = normalizeName(candidate.textContent);
+        const label = String((candidate.getAttribute && candidate.getAttribute("aria-label")) || "");
+        if (NOT_CREATE_RE.test(label)) continue;
+        if (!(CREATE_TEXT_RE.test(text) || CREATE_LABEL_RE.test(label))) continue;
+        // Deepest wins: an outer wrapper carries the text of every child, so
+        // without this the popover itself would look like the "+" button.
+        const depth = depthWithin(candidate, scope);
+        if (depth > bestDepth) {
+          bestDepth = depth;
+          best = candidate;
+        }
+      }
+      if (best) return best.closest('button, [role="button"], a') || best;
+    }
+    return findHeaderControl(panel, relaxed);
+  }
+
+  /*
+   * A popover whose ONLY entry point is "Add collection" / "Add to collection"
+   * is a DOORWAY, not the picker: hovering the bookmark shows that one control,
+   * and clicking it is what opens the panel that lists the collections.
+   *
+   * Measured on a real failing run (its per-post audit, 5 posts, every one
+   * identical): rows seen = ["add collection"], controls = div(add collection) /
+   * svg[Add collection], and no create control was found - because the wording is
+   * neither "New collection" nor "+". The writer was matching rows inside the
+   * doorway, finding none, and then failing to create the collection. Nothing to
+   * do with tab visibility, and nothing a wider create ladder fixes.
+   */
+  const DOORWAY_RE = /^(add|save)( to)?( my)? collection$|^add collection$|^add$/i;
+
+  /** The "Add collection" control that opens the real picker, if there is one. */
+  function findDoorwayButton(panel) {
+    const relaxed = insideRevealed(panel);
+    const candidates = [
+      ...panel.querySelectorAll('button, [role="button"], [tabindex], svg, [aria-label]')
+    ].filter((element) => isUsable(element, relaxed));
+    let best = null;
+    let bestDepth = -1;
+    for (const element of candidates) {
+      const text = normalizeName(element.textContent);
+      const label = normalizeName(
+        (element.getAttribute && element.getAttribute("aria-label")) || ""
+      );
+      if (!DOORWAY_RE.test(text) && !DOORWAY_RE.test(label)) continue;
+      // Deepest wins: the wrapper around it carries the same text.
+      const depth = depthWithin(element, panel);
+      if (depth > bestDepth) {
+        bestDepth = depth;
+        best = element;
+      }
+    }
+    return best ? best.closest('button, [role="button"], [tabindex]') || best : null;
+  }
+
+  /** True when a panel has no collection rows and a doorway control to click. */
+  function doorwayIn(panel) {
+    if (!panel) return null;
+    const button = findDoorwayButton(panel);
+    if (!button) return null;
+    const rows = panelRows(panel, { relaxed: insideRevealed(panel) });
+    // Any OTHER row means this is a real picker that merely also offers the
+    // control - clicking it there would be wrong, so the doorway is refused.
+    if (rows.some((row) => !button.contains(row))) return null;
+    return button;
+  }
+
+  /**
+   * Last resort, for a header control that words itself as nothing we know: the
+   * LAST icon-bearing clickable that comes before the first row, which is where
+   * the "+" sits on every build we have seen. Deliberately skipped when the
+   * picker shows no rows at all - then there is nothing to be the header of, and
+   * returning a random control is worse than failing. The post's own action
+   * controls are excluded and the search never leaves the popover.
+   */
+  function findHeaderControl(panel, relaxed) {
+    const DOCUMENT_POSITION_FOLLOWING = 4;
+    const rows = panelRows(panel, { relaxed });
+    if (!rows.length) return null;
+    const firstRow = rows[0];
+    let best = null;
+    for (const element of panel.querySelectorAll('button, [role="button"], [tabindex], svg')) {
+      if (!isUsable(element, relaxed)) continue;
+      if (element.tagName.toLowerCase() !== "svg" && !element.querySelector("svg")) continue;
+      const label = String((element.getAttribute && element.getAttribute("aria-label")) || "");
+      if (NOT_CREATE_RE.test(label)) continue;
+      if (rows.some((row) => row === element || row.contains(element))) continue;
+      // Must come BEFORE the first row: the header is above the list.
+      if (!(element.compareDocumentPosition(firstRow) & DOCUMENT_POSITION_FOLLOWING)) continue;
+      best = element;
+    }
+    return best ? best.closest('button, [role="button"]') || best : null;
+  }
+
+  /**
+   * What the picker actually contained, appended to the failure message. A bare
+   * "button not found" costs another round of guessing; this names the rows and
+   * the controls that were usable, so the next report is conclusive.
+   */
+  /** The controls of a picker, named compactly (used by the sample and audit). */
+  function panelControls(panel) {
+    const relaxed = insideRevealed(panel);
+    const candidates = [
+      ...panel.querySelectorAll('button, [role="button"], a, [tabindex], svg')
+    ];
+    /*
+     * Usable controls first, then the ones that exist but are unusable (marked
+     * `:collapsed` below). A control that measures 0x0 is precisely the thing
+     * worth naming when something stops matching, but it must not push the usable
+     * controls off a list capped at six.
+     */
+    return [
+      ...candidates.filter((element) => isUsable(element, relaxed)),
+      ...candidates.filter((element) => !isUsable(element, relaxed) && element.isConnected)
+    ]
+      .slice(0, 6)
+      .map((element) => {
+        const tag = element.tagName.toLowerCase();
+        const label = element.getAttribute && element.getAttribute("aria-label");
+        const text = normalizeName(element.textContent).slice(0, 14);
+        return `${tag}${label ? `[${label}]` : ""}${text ? `(${text})` : ""}${
+          isVisible(element) ? "" : ":collapsed"
+        }`;
+      });
+  }
+
+  function panelSample(panel) {
+    if (!panel) return "no panel";
+    const relaxed = insideRevealed(panel);
+    const labels = panelRows(panel, { relaxed })
+      .slice(0, 6)
+      .map((row) => `"${normalizeName(row.textContent).slice(0, 24)}"`)
+      .join(", ");
+    const controls = panelControls(panel);
+    return (
+      `rows: ${labels || "none"}` +
+      `; control(s): ${controls.join(" ") || "none"}` +
+      `${trace.panelRevealed ? "; popover was force-revealed" : ""}`
+    );
+  }
+
+  /**
+   * The step an error came from, as a short phrase. The popup's per-post audit
+   * shows this next to the raw message, so "which step died" is readable without
+   * decoding the error string.
+   */
+  function stepFromError(message) {
+    const text = String(message || "");
+    const timeout = text.match(/timeout_waiting_for_([a-z_]+)/);
+    if (timeout) return `timed out waiting for the ${timeout[1].replace(/_/g, " ")}`;
+    const named = text.match(
+      /(save_panel_unreachable|save_panel_not_trusted|new_collection_button_not_found|collection_name_input|missing_category|instagram_login_required|post_page_[a-z]+)/
+    );
+    if (named) return named[1].replace(/_/g, " ");
+    return "unknown step";
+  }
+
+  async function createCollection(panel, category) {
+    /*
+     * Two ways in, and the second one exists because of a real build: the picker
+     * can offer a create control (the normal case), or the panel we are looking at
+     * has ALREADY opened the "name your collection" form - which is what clicking
+     * a doorway popover's "Add collection" sometimes does. A plainly labelled
+     * input is trusted in either case; an unlabelled one only counts when it
+     * appeared AFTER our click, so a reels comment box can never be typed into.
+     */
     const preexisting = new Set(
       [...document.querySelectorAll('input[type="text"], input:not([type])')]
     );
-
-    clickElement(newButton);
-    await sleep(300);
-
-    const input = await waitFor(
-      () =>
-        findCollectionNameInput({ scope: panel, exclude: preexisting }) ||
-        findCollectionNameInput({ exclude: preexisting }),
-      { timeout: 6000, interval: 150, label: "collection_name_input" }
-    );
+    let input = findCollectionNameInput({ scope: panel, requireLabel: true });
+    if (!input) {
+      const newButton = findCreateControl(panel);
+      if (!newButton) {
+        throw new Error(`new_collection_button_not_found (${panelSample(panel)})`);
+      }
+      clickElement(newButton);
+      await sleep(300);
+      input = await waitFor(
+        () =>
+          findCollectionNameInput({ scope: panel, exclude: preexisting }) ||
+          findCollectionNameInput({ exclude: preexisting }),
+        { timeout: 6000, interval: 150, label: "collection_name_input" }
+      );
+    }
 
     setInputValue(input, category);
     await sleep(250);
@@ -1308,18 +1866,21 @@
     // The popover can close or unmount the moment a row is clicked, and a
     // detached node reports nothing at all - which would look like a failure
     // even when the write landed. So re-open it through the same routes the
-    // writer uses, reveal included.
+    // writer uses, reveal included - two-phase (see hoverWithRetry), because a
+    // row click's events can dedupe the plain enter.
     const open = findSavePanel({ allowReveal: true });
     if (open) return open;
     const target = findSaveIcon() || icon;
     if (!target) return null;
-    hoverElement(target);
     try {
-      return await waitFor(() => findSavePanel({ allowReveal: true }), {
-        timeout: 2500,
-        interval: 200,
-        label: "panel_reopen_for_verification"
-      });
+      return await hoverWithRetry(target, () =>
+        waitFor(() => findSavePanel({ allowReveal: true }), {
+          timeout: 1500,
+          interval: 200,
+          label: "panel_reopen_for_verification"
+        }),
+        { phaseDelay: 250 }
+      );
     } catch {
       return null;
     }
@@ -1330,11 +1891,17 @@
    * ---------------------------------------------------------------------- */
 
   async function performWrite(category, shortcode) {
+    // Warm up the clamp measurement rather than paying for it inside the first
+    // wait: the answer (see measureTimerClamp) decides every budget after it.
+    measureTimerClamp();
     trace.saveIconStrategy = null;
     trace.panelStrategy = null;
     trace.panelOpenStrategy = null;
     trace.moreStrategy = null;
     trace.openedViaHover = false;
+    trace.openedViaDoorway = false;
+    trace.doorwayText = null;
+    trace.doorwayError = null;
     trace.panelRevealed = false;
     trace.panelSuspicious = false;
     trace.restoredSavedState = null;
@@ -1376,6 +1943,14 @@
       });
 
       const panel = await openSavePanel(icon);
+      /*
+       * What this post's picker exposed, recorded the moment it is found. The
+       * popup's per-post audit renders it, so a finished run can be read post by
+       * post (which route opened the picker, which rows were there, which controls
+       * were usable) instead of only as one error line.
+       */
+      result.trace.panelSample = panelSample(panel);
+      result.trace.panelControls = panelControls(panel);
       if (panelLooksSuspicious(panel)) {
         trace.panelSuspicious = true;
         pressEscape();
@@ -1420,6 +1995,14 @@
           }
         }
       } else {
+        /*
+         * No row matched, and there are two very different worlds behind that:
+         * the collection genuinely does not exist yet (so create it), or the
+         * picker's rows could not be read at all (in which case creating one
+         * will fail too). findCollectionRow() recorded what it saw (rowsSeen) and
+         * the picker's controls were recorded above, so the post itself says
+         * which world this was.
+         */
         await createCollection(panel, category);
         result.trace.rowMatched = "created";
         // Creating a collection is the one path where nothing was clicked in an
@@ -1462,6 +2045,12 @@
       return result;
     } catch (error) {
       result.error = String((error && error.message) || error);
+      // Named explicitly, because it is the difference between "Instagram
+      // changed its DOM" and "nobody was looking at the page".
+      if (isPageHidden() && !/page_hidden/.test(result.error)) {
+        result.error += " [page_hidden]";
+      }
+      result.trace.failedStep = stepFromError(result.error);
       return result;
     } finally {
       // Whatever happened, the page must be left as we found it: release the
@@ -1477,10 +2066,15 @@
       result.trace.moreStrategy = trace.moreStrategy;
       result.trace.openedViaMenu = trace.openedViaMenu;
       result.trace.openedViaHover = trace.openedViaHover;
+      result.trace.openedViaDoorway = trace.openedViaDoorway;
+      result.trace.doorwayText = trace.doorwayText;
+      result.trace.doorwayError = trace.doorwayError;
       result.trace.panelRevealed = trace.panelRevealed;
       result.trace.routeErrors = trace.routeErrors || null;
       result.trace.panelSuspicious = trace.panelSuspicious;
       result.trace.restoredSavedState = trace.restoredSavedState;
+      result.trace.pageHidden = isPageHidden();
+      result.trace.timerClampMs = timerClampMs;
     }
   }
 
@@ -1581,12 +2175,18 @@
    */
   function rowInventory(panel, category) {
     const wanted = normalizeName(category);
+    // Same rule as the write path (see isUsable): inside a popover the probe
+    // force-revealed, rows count even when Instagram keeps them collapsed. The
+    // probe has to agree with the writer, or it reports a MISS for a step the
+    // writer would happily carry out.
+    const relaxed = insideRevealed(panel);
     const rows = [];
     const seen = new Set();
     for (const element of panel.querySelectorAll("*")) {
-      if (!isVisible(element)) continue;
+      if (!isUsable(element, relaxed)) continue;
       const text = normalizeName(element.textContent);
       if (!text || text.length > 60 || seen.has(text)) continue;
+      if (text === "collections") continue;
       const isContainer = [...element.children].some(
         (child) => normalizeName(child.textContent) !== ""
       );
@@ -1693,13 +2293,19 @@
     let hoverError = null;
     let revealedMounted = false;
     if (icon) {
-      hoverElement(icon);
+      // The same two-phase hover the real run uses, so a dry run reports what
+      // a sort would actually do (plain hover first, leave-first retry second).
       try {
-        hoverPanel = await waitFor(findSavePanel, {
-          timeout: 3000,
-          interval: 200,
-          label: "popover_on_hover"
-        });
+        hoverPanel = await hoverWithRetry(
+          icon,
+          () =>
+            waitFor(findSavePanel, {
+              timeout: 1500,
+              interval: 200,
+              label: "popover_on_hover"
+            }),
+          { phaseDelay: 250 }
+        );
       } catch (error) {
         hoverError = error.message;
       }
@@ -1767,6 +2373,18 @@
     if (panel) {
       addStep("2. save panel", "RESOLVED", `strategy: ${trace.panelStrategy}`, panel);
 
+      // The writer clicks through a doorway popover to reach the real picker (see
+      // escalateThroughDoorway); the probe reports it instead of clicking.
+      const doorwayButton = doorwayIn(panel);
+      if (doorwayButton) {
+        addStep(
+          "2b. add-collection doorway",
+          "RESOLVED",
+          `this panel only offers "${normalizeName(doorwayButton.textContent) || "add collection"}", so the real run clicks it and works in the picker that opens`,
+          doorwayButton
+        );
+      }
+
       const rows = rowInventory(panel, category);
       const match = findCollectionRow(panel, category);
       lines.push(`    rows found  : ${rows.length}`);
@@ -1792,15 +2410,15 @@
           "MISS",
           `no row matched "${category}" — the writer would create the collection instead`
         );
-        const newButton = findButtonByText(panel, [
-          "new collection",
-          "create new collection",
-          "new"
-        ]);
+        // Same ladder the writer uses, so this step cannot report a MISS for a
+        // control the real run would find (and vice versa).
+        const newButton = findCreateControl(panel);
         addStep(
           "4a. new collection btn",
           newButton ? "RESOLVED" : "MISS",
-          newButton ? "would click" : "no visible button with that text",
+          newButton
+            ? "would click"
+            : `no create control matched by text, aria-label or header order (${panelSample(panel)})`,
           newButton
         );
         const nameInput = findCollectionNameInput({ requireLabel: true });
@@ -1916,6 +2534,11 @@
       category: category || null,
       shortcode: shortcode || null,
       panelOpen: !!panel,
+      // The probe runs in a tab we opened ourselves, usually in the background,
+      // and a hidden tab is throttled and rendered less. Reported so a MISS is
+      // not mistaken for a broken selector.
+      pageHidden: isPageHidden(),
+      timerClampMs,
       unverifiable: skipped + notOpen,
       steps,
       inventory,
